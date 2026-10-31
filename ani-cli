@@ -218,6 +218,29 @@ hianime_episodes() {
         sed -nE "s|.*data-number=\"([^\"]*)\".*data-id=\"([0-9]+)\".*/watch/${1}[?]ep=.*|\\2\\t\\1|p"
 }
 
+# Prefer Brazilian Portuguese subtitles when the embed provides them. HiAnime's
+# language field is not always reliable, so also inspect the track label and URL.
+# Keep the existing default track as the final fallback for older responses.
+select_subtitle_link() {
+    case "$1" in
+        *'"subtitles"'*) ;;
+        *) return 0 ;;
+    esac
+
+    _subtitle_entries=$(printf "%s" "$1" | sed -E \
+        's|.*"subtitles"[[:space:]]*:[[:space:]]*\[||; s|\][^]]*$||; s|[}][[:space:]]*,[[:space:]]*[{]|}\n{|g')
+
+    _subtitle=$(printf "%s\n" "$_subtitle_entries" | grep -iE \
+        'pt[-_ ]?br|brazil|brasileir' | head -n 1)
+    [ -n "$_subtitle" ] || _subtitle=$(printf "%s\n" "$_subtitle_entries" | grep -iE \
+        'portugu[eê]s|portuguese|/por[-_.][^" ]*\.vtt|por-[0-9]+\.vtt' | head -n 1)
+    [ -n "$_subtitle" ] || _subtitle=$(printf "%s\n" "$_subtitle_entries" | grep -iE \
+        'english|ingles|/eng[-_.][^" ]*\.vtt|eng-[0-9]+\.vtt' | head -n 1)
+    [ -n "$_subtitle" ] || _subtitle=$(printf "%s\n" "$_subtitle_entries" | grep -m 1 '"default":true')
+
+    printf "%s\n" "$_subtitle" | sed -nE 's|.*"src"[[:space:]]*:[[:space:]]*"([^"]+)".*|\1|p'
+}
+
 # resolves episode $1 in mode $2 (sub/dub): sets links (quality >url per line), sub_link, mal_id and refr
 hianime_m3u8() {
     _ep_id=$(printf "%s" "$episode_maps" | sed -nE "s|^([0-9]+)\t${1}$|\1|p")
@@ -235,7 +258,7 @@ hianime_m3u8() {
     _json="$(deobfuscate_blob "$_blob")"
     _m3u8_master="$(printf "%s" "$_json" | sed -nE 's|.*"src":"([^"]*\.m3u8[^"]*)".*|\1|p')"
     [ -z "$_m3u8_master" ] && return 1
-    sub_link="$(printf "%s" "$_json" | sed 's|.*"subtitles":\[||; s|}\].*||; s|},{|}\n{|g' | grep -m 1 '"default":true' | sed -nE 's|.*"src":"([^"]*)".*|\1|p')"
+    sub_link=$(select_subtitle_link "$_json")
     _playlist="$(hianime_curl "$_m3u8_master" -e "$refr")"
     # quality variants are relative to the master playlist
     links="$(printf "%s\n" "$_playlist" | sed 's|^#EXT-X-STREAM.*x||g; s|,.*|p|g; /^#/d; $!N; s|\n| >|;/EXT-X-I-FRAME/d' | sed "\|>https*://|!s|>|>${_m3u8_master%/*}/|" | sort -g -r -s)"

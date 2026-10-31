@@ -559,7 +559,7 @@ Ani-skip uses the external lua script function of mpv and as such â€“ for now â€
 ## FAQ
 <details>
 	
-* Can I change subtitle language or turn them off? - Subtitles are a separate english track handed to the player, so you can toggle them there (mpv: press `v`). Other languages are not offered.
+* Which subtitle language is selected? - ani-cli prefers a Portuguese track when the selected HiAnime server provides one; otherwise it uses the English track (or the server's default track). In mpv, press `v` to toggle subtitles.
 * Can I watch dub? - Yes, use `--dub`.
 * Can I change dub language? - No.
 * Can I change media source? - No (unless you can scrape that source yourself).
