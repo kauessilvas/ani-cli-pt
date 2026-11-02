@@ -97,7 +97,7 @@ A home destaca o anime mais bem colocado na lista atual de séries em exibição
 
 ### Capturas da interface
 
-Na home, o destaque vem do topo da lista atual de animes em exibição. O carrossel mostra outros títulos da temporada.
+As capturas abaixo mostram a interface no tema escuro. Na home, o destaque vem do topo da lista atual de animes em exibição; o carrossel mostra outros títulos da temporada.
 
 <p align="center">
   <img src="docs/screenshots/home-desktop.png" width="68%" alt="Home do ani-cli-pt em desktop, com One Piece em destaque e carrossel de animes da temporada">
