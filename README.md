@@ -88,3 +88,49 @@ sh tests/test-subtitle-selection.sh
 O ani-cli-pt é um fork do [pystardust/ani-cli](https://github.com/pystardust/ani-cli), cujo código e fluxo servem de base para este projeto. As alterações desta versão concentram-se na seleção de legendas e na experiência em português.
 
 Este projeto mantém a licença GPL-3.0 do ani-cli. Consulte [LICENSE](./LICENSE) e o [aviso de uso](./disclaimer.md).
+
+## Interface web local
+
+O ani-cli-pt também inclui uma interface web local para explorar o catálogo e assistir no player integrado ao navegador. Ela usa o script `ani-cli` deste repositório para localizar a fonte e manter a preferência de legendas do projeto. O `mpv` continua disponível para o uso pelo terminal.
+
+A home destaca o anime mais bem colocado na lista atual de séries em exibição e traz um carrossel para descobrir outros títulos da temporada, com banner e pôster em alta resolução e busca permanente. Favoritos e histórico de episódios ficam salvos no navegador atual; o histórico marca um episódio quando a reprodução começa e permite registrar ou corrigir o status manualmente. O seletor diferencia episódios vistos e não vistos e adapta a lista para telas menores.
+
+### Capturas da interface
+
+Na home, o destaque vem do topo da lista atual de animes em exibição. O carrossel mostra outros títulos da temporada.
+
+<p align="center">
+  <img src="docs/screenshots/home-desktop.png" width="68%" alt="Home do ani-cli-pt em desktop, com One Piece em destaque e carrossel de animes da temporada">
+  <img src="docs/screenshots/home-mobile.png" width="28%" alt="Home do ani-cli-pt adaptada para celular">
+</p>
+
+O guia de episódios exibe o progresso salvo neste navegador e permite filtrar a lista por episódios vistos e não vistos.
+
+<p align="center">
+  <img src="docs/screenshots/episodes-desktop.png" width="68%" alt="Seletor de episódios em desktop, mostrando histórico e filtros de progresso">
+  <img src="docs/screenshots/episodes-mobile.png" width="28%" alt="Seletor de episódios adaptado para celular">
+</p>
+
+Requisitos para a interface web: Python 3, fzf, curl, grep e sed, além de um navegador moderno com reprodução HLS. O `mpv` é necessário para reproduzir pelo terminal. No Arch Linux/CachyOS, instale os pacotes com:
+
+```bash
+sudo pacman -S python mpv fzf curl grep sed
+```
+
+Inicie o servidor dentro da pasta do projeto:
+
+```bash
+./web/start.sh
+```
+
+Depois abra <http://127.0.0.1:8765> no navegador. Mantenha o terminal aberto enquanto usa a interface; `Ctrl+C` encerra o servidor. O serviço escuta apenas no próprio computador por padrão. A interface consulta o catálogo externo e reproduz HLS no player do navegador; o mpv permanece para o fluxo de terminal.
+
+Esta interface precisa do servidor Python e do script `ani-cli`; o GitHub Pages, sozinho, não executa esses componentes.
+
+Ao abrir os detalhes de um anime, a sinopse pública do catálogo é enviada ao [MyMemory](https://mymemory.translated.net/doc/spec.php) para tradução automática para PT-BR. A tradução é mantida em cache enquanto o servidor estiver aberto. Se o serviço falhar ou atingir a cota anônima de [5.000 caracteres por dia](https://mymemory.translated.net/doc/usagelimits.php), a página mostra a sinopse original e oferece a opção de consultá-la.
+
+Execute os testes automatizados da interface/servidor com:
+
+```bash
+python3 -m unittest discover -s web/tests -v
+```
