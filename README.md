@@ -159,7 +159,7 @@ python3 -m unittest discover -s web/tests -v
 
 O repositório também contém o projeto Android em Kotlin em [`android-app/`](./android-app/). Ele é independente da interface web e do servidor local: consulta o catálogo no próprio aparelho, mantém favoritos e histórico no armazenamento local, prioriza legendas PT-BR com fallback para português e inglês e reproduz HLS no player Android. Sinopses e títulos de episódios usam tradução automática via MyMemory quando disponível; o texto público do catálogo é enviado ao serviço para tradução, sujeito à disponibilidade e à cota diária anônima.
 
-Baixe e instale a versão de depuração para Android 8.0 ou mais recente: [**Baixar APK ani-cli-pt 0.1.0**](https://github.com/kauessilvas/ani-cli-pt/raw/refs/heads/ani-cli-pt/android-app/ani-cli-pt-0.1.0-debug.apk). Este APK é uma prévia para testes, assinada com a chave de depuração do Android.
+Baixe a versão de depuração para Android 8.0 ou mais recente na [**release ani-cli-pt 0.1.1**](https://github.com/kauessilvas/ani-cli-pt/releases/latest), que inclui o APK como arquivo para download. Este APK é uma prévia para testes, assinada com a chave de depuração do Android; o Android pode exibir alertas de segurança ao instalar aplicativos distribuídos fora da Play Store.
 
 Para abrir o projeto, use o Android Studio e selecione a pasta `android-app`. Na primeira abertura, o Gradle baixa as dependências do projeto e o Android Studio configura o SDK. Conecte um aparelho Android com depuração USB ativada ou crie um emulador e execute a configuração `app`.
 

@@ -2,6 +2,9 @@ package dev.aniclipt.app
 
 import android.os.Bundle
 import android.Manifest
+import android.app.Activity
+import android.content.pm.ActivityInfo
+import android.content.res.Configuration
 import android.content.pm.PackageManager
 import android.os.Build
 import androidx.activity.ComponentActivity
@@ -23,6 +26,7 @@ import androidx.compose.material.icons.filled.ArrowBack
 import androidx.compose.material.icons.filled.Favorite
 import androidx.compose.material.icons.filled.FavoriteBorder
 import androidx.compose.material.icons.filled.PlayArrow
+import androidx.compose.material.icons.filled.ScreenRotation
 import androidx.compose.material.icons.filled.Search
 import androidx.compose.material.icons.filled.Settings
 import androidx.compose.material3.*
@@ -262,12 +266,8 @@ private fun AnimeHome() {
         }
     }) { padding ->
         Column(Modifier.fillMaxSize().padding(padding)) {
-            val brandShape = RoundedCornerShape(19.dp)
             Row(
-                Modifier.fillMaxWidth().widthIn(max = 960.dp).align(Alignment.CenterHorizontally).padding(horizontal = 16.dp, vertical = 10.dp)
-                    .clip(brandShape).background(Color(0xA8202024))
-                    .border(1.dp, Color.White.copy(alpha = 0.09f), brandShape)
-                    .padding(horizontal = 13.dp, vertical = 9.dp),
+                Modifier.fillMaxWidth().widthIn(max = 960.dp).align(Alignment.CenterHorizontally).padding(horizontal = 24.dp, vertical = 12.dp),
                 verticalAlignment = Alignment.CenterVertically,
             ) {
                 Box(Modifier.size(38.dp).clip(RoundedCornerShape(13.dp)).background(Brush.linearGradient(listOf(Color(0xFF303036), Color(0xFF19191C)))), contentAlignment = Alignment.Center) {
@@ -420,11 +420,6 @@ private fun SettingsScreen(
                 Switch(checked = dubbed, onCheckedChange = onDubbed)
             }
         }
-        Text("LEGENDAS", color = Muted, fontSize = 10.sp, fontWeight = FontWeight.Bold, letterSpacing = 1.3.sp, modifier = Modifier.padding(start = 4.dp, top = 22.dp, bottom = 8.dp))
-        Column(Modifier.fillMaxWidth().clip(RoundedCornerShape(18.dp)).background(Color(0xB8202024)).border(1.dp, Color.White.copy(.08f), RoundedCornerShape(18.dp)).padding(16.dp)) {
-            Text("Português do Brasil primeiro", fontWeight = FontWeight.SemiBold, fontSize = 14.sp)
-            Text("Quando não houver PT-BR na fonte, o app tenta usar legendas em inglês.", color = Muted, fontSize = 12.sp, modifier = Modifier.padding(top = 5.dp))
-        }
         Text("NOTIFICAÇÕES", color = Muted, fontSize = 10.sp, fontWeight = FontWeight.Bold, letterSpacing = 1.3.sp, modifier = Modifier.padding(start = 4.dp, top = 22.dp, bottom = 8.dp))
         Column(Modifier.fillMaxWidth().clip(RoundedCornerShape(18.dp)).background(Color(0xB8202024)).border(1.dp, Color.White.copy(.08f), RoundedCornerShape(18.dp)).padding(16.dp)) {
             Row(verticalAlignment = Alignment.CenterVertically) {
@@ -432,7 +427,7 @@ private fun SettingsScreen(
                 Switch(checked = notificationsEnabled, onCheckedChange = onNotifications)
             }
         }
-        Text("ani-cli-pt · 0.1.0", color = Muted, fontSize = 11.sp, modifier = Modifier.align(Alignment.CenterHorizontally).padding(vertical = 24.dp))
+        Text("ani-cli-pt · 0.1.1", color = Muted, fontSize = 11.sp, modifier = Modifier.align(Alignment.CenterHorizontally).padding(vertical = 24.dp))
     }
 }
 
@@ -499,22 +494,19 @@ private fun EpisodeSheet(anime: Anime, episodes: List<Episode>, watched: Set<Str
             LazyColumn(Modifier.weight(1f), contentPadding = PaddingValues(bottom = 8.dp)) {
                 items(episodes, key = { it.id }) { episode ->
                     val isSelected = picked?.id == episode.id
-                    Row(Modifier.fillMaxWidth().padding(vertical = 3.dp).clip(RoundedCornerShape(13.dp)).background(if (isSelected) Color(0xFF20334A) else Color(0xFF29292E)).clickable { picked = episode }.padding(13.dp), verticalAlignment = Alignment.CenterVertically) {
+                    Row(Modifier.fillMaxWidth().padding(vertical = 3.dp).clip(RoundedCornerShape(13.dp)).background(if (isSelected) Color(0xFF20334A) else Color(0xFF29292E)).clickable { picked = episode }.padding(horizontal = 10.dp, vertical = 9.dp), verticalAlignment = Alignment.CenterVertically) {
                         Text(episode.number.padStart(2, '0'), modifier = Modifier.clip(RoundedCornerShape(9.dp)).background(if (isSelected) Color(0xFF153451) else Color(0xFF38383D)).padding(horizontal = 10.dp, vertical = 8.dp), color = if (isSelected) Color(0xFFB9D9FF) else Muted, fontWeight = FontWeight.Bold, fontSize = 11.sp)
-                        Column(Modifier.weight(1f).padding(horizontal = 12.dp)) {
+                        val hasWatched = "${anime.slug}:${episode.number}" in watched
+                        Column(Modifier.weight(1f).padding(horizontal = 10.dp)) {
                             Text("Episódio ${episode.number}", fontWeight = FontWeight.SemiBold, fontSize = 12.sp)
                             if (episode.title != "Episódio ${episode.number}") Text(episode.title, color = Muted, fontSize = 10.sp, maxLines = 1)
+                            TextButton(onClick = { onToggleWatched(episode) }, contentPadding = PaddingValues(0.dp), modifier = Modifier.heightIn(min = 24.dp)) {
+                                Text(if (hasWatched) "✓ Visto · marcar como não visto" else "Não visto · marcar como visto", color = if (hasWatched) Color(0xFF68D391) else Muted, fontSize = 9.sp, maxLines = 1)
+                            }
                         }
-                        val hasWatched = "${anime.slug}:${episode.number}" in watched
-                        TextButton(onClick = { onToggleWatched(episode) }, contentPadding = PaddingValues(horizontal = 5.dp)) {
-                            Text(if (hasWatched) "Visto" else if (isSelected) "Selecionado" else "Marcar visto", color = if (hasWatched) Color(0xFF68D391) else Muted, fontSize = 9.sp)
-                        }
+                        Button(onClick = { onPlay(episode) }, enabled = !busy, shape = RoundedCornerShape(12.dp), contentPadding = PaddingValues(horizontal = 10.dp, vertical = 8.dp), modifier = Modifier.widthIn(min = 80.dp)) { Icon(Icons.Default.PlayArrow, null, modifier = Modifier.size(17.dp)); Spacer(Modifier.width(2.dp)); Text("Assistir", fontSize = 10.sp, maxLines = 1) }
                     }
                 }
-            }
-            Row(Modifier.fillMaxWidth().padding(vertical = 12.dp), verticalAlignment = Alignment.CenterVertically) {
-                Column(Modifier.weight(1f)) { Text("SELECIONADO", color = Muted, fontSize = 8.sp, fontWeight = FontWeight.Bold, letterSpacing = 1.sp); Text(picked?.let { "Episódio ${it.number}" } ?: "Selecione um episódio", fontSize = 11.sp) }
-                Button(onClick = { picked?.let(onPlay) }, enabled = picked != null && !busy, shape = RoundedCornerShape(13.dp)) { Icon(Icons.Default.PlayArrow, null); Text("Assistir") }
             }
         }
     }
@@ -523,6 +515,10 @@ private fun EpisodeSheet(anime: Anime, episodes: List<Episode>, watched: Set<Str
 @Composable
 private fun NativePlayer(source: PlaybackSource, onClose: () -> Unit, modifier: Modifier = Modifier) {
     val context = LocalContext.current
+    val activity = context as? Activity
+    val configuration = LocalConfiguration.current
+    val isLandscape = configuration.orientation == Configuration.ORIENTATION_LANDSCAPE
+    val previousOrientation = remember(source.videoUrl) { activity?.requestedOrientation ?: ActivityInfo.SCREEN_ORIENTATION_UNSPECIFIED }
     val lifecycleOwner = LocalLifecycleOwner.current
     val playbackError = remember(source.videoUrl) { mutableStateOf<String?>(null) }
     val player = remember(source.videoUrl) {
@@ -561,12 +557,20 @@ private fun NativePlayer(source: PlaybackSource, onClose: () -> Unit, modifier: 
             when (event) { androidx.lifecycle.Lifecycle.Event.ON_PAUSE -> player.pause(); androidx.lifecycle.Lifecycle.Event.ON_RESUME -> if (player.playWhenReady) player.play(); else -> Unit }
         }
         lifecycleOwner.lifecycle.addObserver(observer)
-        onDispose { lifecycleOwner.lifecycle.removeObserver(observer); player.release() }
+        onDispose {
+            lifecycleOwner.lifecycle.removeObserver(observer)
+            player.release()
+            activity?.requestedOrientation = previousOrientation
+        }
     }
     Column(modifier.background(Color.Black).statusBarsPadding()) {
         Row(Modifier.fillMaxWidth().background(Color(0xFF171719)).padding(horizontal = 12.dp, vertical = 10.dp), verticalAlignment = Alignment.CenterVertically) {
             IconButton(onClick = onClose) { Icon(Icons.Default.ArrowBack, "Voltar", tint = Ink) }
             Column(Modifier.padding(start = 4.dp)) { Text(source.title, color = Ink, fontWeight = FontWeight.SemiBold, maxLines = 1); Text("Episódio ${source.episode} · áudio original · legenda selecionada", color = Muted, fontSize = 10.sp) }
+            Spacer(Modifier.weight(1f))
+            IconButton(onClick = { activity?.requestedOrientation = if (isLandscape) ActivityInfo.SCREEN_ORIENTATION_PORTRAIT else ActivityInfo.SCREEN_ORIENTATION_LANDSCAPE }) {
+                Icon(Icons.Default.ScreenRotation, if (isLandscape) "Voltar para modo retrato" else "Girar para modo paisagem", tint = Ink)
+            }
         }
         Box(Modifier.fillMaxWidth().weight(1f), contentAlignment = Alignment.Center) {
             AndroidView(factory = { viewContext -> PlayerView(viewContext).apply { this.player = player; useController = true } }, modifier = Modifier.fillMaxWidth().aspectRatio(16f / 9f))
