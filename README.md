@@ -11,13 +11,27 @@ Uma versão do [ani-cli](https://github.com/pystardust/ani-cli) com foco em lege
 
 A disponibilidade e a identificação das faixas dependem do episódio e do servidor. Por isso, a legenda em português não está disponível em todos os casos.
 
-## Instalação no CachyOS e Arch Linux
+## Instalação
 
-Instale os requisitos:
+O ani-cli-pt roda em Linux e macOS. No Windows, use uma distribuição Linux pelo WSL. Você vai precisar de `git`, `mpv`, `fzf`, `curl`, `grep` e `sed`.
+
+No macOS, instale o [Homebrew](https://brew.sh/) e os programas necessários:
 
 ```bash
+brew install git mpv fzf curl python
+```
+
+No Linux, instale os mesmos programas usando o gerenciador de pacotes da sua distribuição. Exemplos:
+
+```bash
+# Debian e Ubuntu
+sudo apt install git mpv fzf curl grep sed python3
+
+# Arch Linux e CachyOS
 sudo pacman -S mpv fzf curl grep sed git
 ```
+
+No Windows, instale o [WSL](https://learn.microsoft.com/windows/wsl/install), abra o terminal da distribuição Linux instalada e siga as instruções para Linux acima.
 
 Clone a branch do ani-cli-pt e inicie o programa:
 
@@ -111,7 +125,7 @@ O guia de episódios exibe o progresso salvo neste navegador e permite filtrar a
   <img src="docs/screenshots/episodes-mobile.png" width="28%" alt="Seletor de episódios adaptado para celular">
 </p>
 
-Requisitos para a interface web: Python 3, fzf, curl, grep e sed, além de um navegador moderno com reprodução HLS. O `mpv` é necessário para reproduzir pelo terminal. No Arch Linux/CachyOS, instale os pacotes com:
+Requisitos para a interface web: Python 3, fzf, curl, grep e sed, além de um navegador moderno com reprodução HLS. O `mpv` é necessário para reproduzir pelo terminal. Instale Python 3 e as dependências usando o gerenciador de pacotes do seu sistema. Por exemplo, no Arch Linux/CachyOS:
 
 ```bash
 sudo pacman -S python mpv fzf curl grep sed
