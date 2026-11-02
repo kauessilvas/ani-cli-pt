@@ -3,6 +3,7 @@ package dev.aniclipt.app
 import android.os.Bundle
 import android.Manifest
 import android.app.Activity
+import android.graphics.Typeface
 import android.content.pm.ActivityInfo
 import android.content.res.Configuration
 import android.content.pm.PackageManager
@@ -55,6 +56,7 @@ import androidx.media3.datasource.DefaultHttpDataSource
 import androidx.media3.datasource.HttpDataSource.InvalidResponseCodeException
 import androidx.media3.exoplayer.ExoPlayer
 import androidx.media3.ui.PlayerView
+import androidx.media3.ui.CaptionStyleCompat
 import coil.compose.AsyncImage
 import dev.aniclipt.app.data.Anime
 import dev.aniclipt.app.data.AnimeRepository
@@ -123,6 +125,10 @@ private fun AnimeHome() {
     var source by remember { mutableStateOf<PlaybackSource?>(null) }
     var dubbed by remember { mutableStateOf(prefs.getBoolean("default_dubbed", false)) }
     var quality by remember { mutableStateOf(prefs.getString("quality", "best") ?: "best") }
+    var subtitleSize by remember { mutableStateOf(prefs.getString("subtitle_size", "medium") ?: "medium") }
+    var subtitleColor by remember { mutableStateOf(prefs.getString("subtitle_color", "white") ?: "white") }
+    var subtitleFont by remember { mutableStateOf(prefs.getString("subtitle_font", "sans") ?: "sans") }
+    var subtitleBackground by remember { mutableStateOf(prefs.getString("subtitle_background", "translucent") ?: "translucent") }
     var favoriteView by remember { mutableStateOf(false) }
     var settingsView by remember { mutableStateOf(false) }
     var notificationsEnabled by remember { mutableStateOf(prefs.getBoolean("episode_notifications", false)) }
@@ -291,6 +297,14 @@ private fun AnimeHome() {
                     onDubbed = { dubbed = it; prefs.edit().putBoolean("default_dubbed", it).apply() },
                     notificationsEnabled = notificationsEnabled,
                     onNotifications = ::setNotificationsEnabled,
+                    subtitleSize = subtitleSize,
+                    onSubtitleSize = { subtitleSize = it; prefs.edit().putString("subtitle_size", it).apply() },
+                    subtitleColor = subtitleColor,
+                    onSubtitleColor = { subtitleColor = it; prefs.edit().putString("subtitle_color", it).apply() },
+                    subtitleFont = subtitleFont,
+                    onSubtitleFont = { subtitleFont = it; prefs.edit().putString("subtitle_font", it).apply() },
+                    subtitleBackground = subtitleBackground,
+                    onSubtitleBackground = { subtitleBackground = it; prefs.edit().putString("subtitle_background", it).apply() },
                 )
             } else LazyColumn(Modifier.weight(1f).widthIn(max = 960.dp).align(Alignment.CenterHorizontally), contentPadding = PaddingValues(bottom = 20.dp)) {
                 if (!favoriteView && query.isBlank() && featured != null) {
@@ -329,16 +343,10 @@ private fun AnimeHome() {
     }
 
     if (selected != null && source == null) {
-        EpisodeSheet(anime = selected!!, episodes = episodes, watched = history.split(',').filter { it.isNotBlank() }.toSet(), busy = busy, error = error, dubbed = dubbed, onDubbed = { dubbed = it; prefs.edit().putBoolean("default_dubbed", it).apply() }, quality = quality, onQuality = { quality = it; prefs.edit().putString("quality", it).apply() }, favorites = favorites, onFavorite = { toggleFavorite(selected!!) }, onClose = { selected = null; error = null }, onToggleWatched = { episode ->
-            val key = "${selected!!.slug}:${episode.number}"
-            val watched = history.split(',').filter { it.isNotBlank() }.toMutableSet()
-            if (!watched.add(key)) watched.remove(key)
-            history = watched.joinToString(",")
-            prefs.edit().putString("history", history).apply()
-        }, onPlay = { episode -> play(selected!!, episode) })
+        EpisodeSheet(anime = selected!!, episodes = episodes, watched = history.split(',').filter { it.isNotBlank() }.toSet(), busy = busy, error = error, dubbed = dubbed, onDubbed = { dubbed = it; prefs.edit().putBoolean("default_dubbed", it).apply() }, quality = quality, onQuality = { quality = it; prefs.edit().putString("quality", it).apply() }, favorites = favorites, onFavorite = { toggleFavorite(selected!!) }, onClose = { selected = null; error = null }, onPlay = { episode -> play(selected!!, episode) })
     }
     if (source != null) {
-        NativePlayer(source = source!!, onClose = { source = null }, modifier = Modifier.fillMaxSize())
+        NativePlayer(source = source!!, onClose = { source = null }, subtitleSize = subtitleSize, subtitleColor = subtitleColor, subtitleFont = subtitleFont, subtitleBackground = subtitleBackground, modifier = Modifier.fillMaxSize())
     }
     }
 }
@@ -399,6 +407,14 @@ private fun SettingsScreen(
     onDubbed: (Boolean) -> Unit,
     notificationsEnabled: Boolean,
     onNotifications: (Boolean) -> Unit,
+    subtitleSize: String,
+    onSubtitleSize: (String) -> Unit,
+    subtitleColor: String,
+    onSubtitleColor: (String) -> Unit,
+    subtitleFont: String,
+    onSubtitleFont: (String) -> Unit,
+    subtitleBackground: String,
+    onSubtitleBackground: (String) -> Unit,
 ) {
     val qualityOptions = listOf("best" to "Automática (melhor disponível)", "1080p" to "1080p", "720p" to "720p", "480p" to "480p", "360p" to "360p")
     var qualityExpanded by remember { mutableStateOf(false) }
@@ -420,6 +436,16 @@ private fun SettingsScreen(
                 Switch(checked = dubbed, onCheckedChange = onDubbed)
             }
         }
+        Text("APARÊNCIA DAS LEGENDAS", color = Muted, fontSize = 10.sp, fontWeight = FontWeight.Bold, letterSpacing = 1.3.sp, modifier = Modifier.padding(start = 4.dp, top = 22.dp, bottom = 8.dp))
+        Column(Modifier.fillMaxWidth().clip(RoundedCornerShape(18.dp)).background(Color(0xB8202024)).border(1.dp, Color.White.copy(.08f), RoundedCornerShape(18.dp)).padding(horizontal = 16.dp)) {
+            SubtitlePreferenceRow("Tamanho", subtitleSize, listOf("small" to "Pequeno", "medium" to "Médio", "large" to "Grande"), onSubtitleSize)
+            HorizontalDivider(color = Color.White.copy(.08f))
+            SubtitlePreferenceRow("Cor do texto", subtitleColor, listOf("white" to "Branco", "yellow" to "Amarelo", "cyan" to "Ciano", "green" to "Verde"), onSubtitleColor)
+            HorizontalDivider(color = Color.White.copy(.08f))
+            SubtitlePreferenceRow("Tipo de letra", subtitleFont, listOf("sans" to "Sem serifa", "serif" to "Serifada", "mono" to "Monoespaçada"), onSubtitleFont)
+            HorizontalDivider(color = Color.White.copy(.08f))
+            SubtitlePreferenceRow("Fundo", subtitleBackground, listOf("none" to "Sem fundo", "translucent" to "Translúcido", "dark" to "Escuro"), onSubtitleBackground)
+        }
         Text("NOTIFICAÇÕES", color = Muted, fontSize = 10.sp, fontWeight = FontWeight.Bold, letterSpacing = 1.3.sp, modifier = Modifier.padding(start = 4.dp, top = 22.dp, bottom = 8.dp))
         Column(Modifier.fillMaxWidth().clip(RoundedCornerShape(18.dp)).background(Color(0xB8202024)).border(1.dp, Color.White.copy(.08f), RoundedCornerShape(18.dp)).padding(16.dp)) {
             Row(verticalAlignment = Alignment.CenterVertically) {
@@ -431,6 +457,24 @@ private fun SettingsScreen(
     }
 }
 
+@Composable
+private fun SubtitlePreferenceRow(title: String, selected: String, options: List<Pair<String, String>>, onSelect: (String) -> Unit) {
+    var expanded by remember { mutableStateOf(false) }
+    Row(Modifier.fillMaxWidth().padding(vertical = 5.dp), verticalAlignment = Alignment.CenterVertically) {
+        Text(title, modifier = Modifier.weight(1f), fontWeight = FontWeight.SemiBold, fontSize = 14.sp)
+        Box {
+            TextButton(onClick = { expanded = true }) {
+                Text(options.firstOrNull { it.first == selected }?.second ?: options.first().second, color = Color(0xFFB9D9FF), fontSize = 12.sp, maxLines = 1)
+            }
+            DropdownMenu(expanded = expanded, onDismissRequest = { expanded = false }) {
+                options.forEach { (value, label) ->
+                    DropdownMenuItem(text = { Text(label) }, onClick = { onSelect(value); expanded = false })
+                }
+            }
+        }
+    }
+}
+
 private fun qualityLabel(quality: String): String = when (quality) {
     "best" -> "Automática"
     else -> quality
@@ -438,7 +482,7 @@ private fun qualityLabel(quality: String): String = when (quality) {
 
 @OptIn(ExperimentalMaterial3Api::class)
 @Composable
-private fun EpisodeSheet(anime: Anime, episodes: List<Episode>, watched: Set<String>, busy: Boolean, error: String?, dubbed: Boolean, onDubbed: (Boolean) -> Unit, quality: String, onQuality: (String) -> Unit, favorites: Set<String>, onFavorite: () -> Unit, onClose: () -> Unit, onToggleWatched: (Episode) -> Unit, onPlay: (Episode) -> Unit) {
+private fun EpisodeSheet(anime: Anime, episodes: List<Episode>, watched: Set<String>, busy: Boolean, error: String?, dubbed: Boolean, onDubbed: (Boolean) -> Unit, quality: String, onQuality: (String) -> Unit, favorites: Set<String>, onFavorite: () -> Unit, onClose: () -> Unit, onPlay: (Episode) -> Unit) {
     var picked by remember(anime.slug) { mutableStateOf<Episode?>(null) }
     var qualityExpanded by remember { mutableStateOf(false) }
     val sheetState = rememberModalBottomSheetState(skipPartiallyExpanded = true)
@@ -494,15 +538,16 @@ private fun EpisodeSheet(anime: Anime, episodes: List<Episode>, watched: Set<Str
             LazyColumn(Modifier.weight(1f), contentPadding = PaddingValues(bottom = 8.dp)) {
                 items(episodes, key = { it.id }) { episode ->
                     val isSelected = picked?.id == episode.id
-                    Row(Modifier.fillMaxWidth().padding(vertical = 3.dp).clip(RoundedCornerShape(13.dp)).background(if (isSelected) Color(0xFF20334A) else Color(0xFF29292E)).clickable { picked = episode }.padding(horizontal = 10.dp, vertical = 9.dp), verticalAlignment = Alignment.CenterVertically) {
-                        Text(episode.number.padStart(2, '0'), modifier = Modifier.clip(RoundedCornerShape(9.dp)).background(if (isSelected) Color(0xFF153451) else Color(0xFF38383D)).padding(horizontal = 10.dp, vertical = 8.dp), color = if (isSelected) Color(0xFFB9D9FF) else Muted, fontWeight = FontWeight.Bold, fontSize = 11.sp)
-                        val hasWatched = "${anime.slug}:${episode.number}" in watched
+                    val hasWatched = "${anime.slug}:${episode.number}" in watched
+                    val rowShape = RoundedCornerShape(13.dp)
+                    Row(Modifier.fillMaxWidth().padding(vertical = 3.dp).clip(rowShape)
+                        .background(if (hasWatched) Color(0xFF20382F) else Color(0xFF29292E))
+                        .border(if (isSelected) 1.dp else 0.dp, if (isSelected) Color(0xFF5598E8) else Color.Transparent, rowShape)
+                        .clickable { picked = episode }.padding(horizontal = 10.dp, vertical = 9.dp), verticalAlignment = Alignment.CenterVertically) {
+                        Text(episode.number.padStart(2, '0'), modifier = Modifier.clip(RoundedCornerShape(9.dp)).background(if (hasWatched) Color(0xFF28513F) else if (isSelected) Color(0xFF153451) else Color(0xFF38383D)).padding(horizontal = 10.dp, vertical = 8.dp), color = if (hasWatched) Color(0xFF9CE0B9) else if (isSelected) Color(0xFFB9D9FF) else Muted, fontWeight = FontWeight.Bold, fontSize = 11.sp)
                         Column(Modifier.weight(1f).padding(horizontal = 10.dp)) {
                             Text("Episódio ${episode.number}", fontWeight = FontWeight.SemiBold, fontSize = 12.sp)
                             if (episode.title != "Episódio ${episode.number}") Text(episode.title, color = Muted, fontSize = 10.sp, maxLines = 1)
-                            TextButton(onClick = { onToggleWatched(episode) }, contentPadding = PaddingValues(0.dp), modifier = Modifier.heightIn(min = 24.dp)) {
-                                Text(if (hasWatched) "✓ Visto · marcar como não visto" else "Não visto · marcar como visto", color = if (hasWatched) Color(0xFF68D391) else Muted, fontSize = 9.sp, maxLines = 1)
-                            }
                         }
                         Button(onClick = { onPlay(episode) }, enabled = !busy, shape = RoundedCornerShape(12.dp), contentPadding = PaddingValues(horizontal = 10.dp, vertical = 8.dp), modifier = Modifier.widthIn(min = 80.dp)) { Icon(Icons.Default.PlayArrow, null, modifier = Modifier.size(17.dp)); Spacer(Modifier.width(2.dp)); Text("Assistir", fontSize = 10.sp, maxLines = 1) }
                     }
@@ -513,7 +558,7 @@ private fun EpisodeSheet(anime: Anime, episodes: List<Episode>, watched: Set<Str
 }
 
 @Composable
-private fun NativePlayer(source: PlaybackSource, onClose: () -> Unit, modifier: Modifier = Modifier) {
+private fun NativePlayer(source: PlaybackSource, onClose: () -> Unit, subtitleSize: String, subtitleColor: String, subtitleFont: String, subtitleBackground: String, modifier: Modifier = Modifier) {
     val context = LocalContext.current
     val activity = context as? Activity
     val configuration = LocalConfiguration.current
@@ -564,7 +609,7 @@ private fun NativePlayer(source: PlaybackSource, onClose: () -> Unit, modifier: 
         }
     }
     Column(modifier.background(Color.Black).statusBarsPadding()) {
-        Row(Modifier.fillMaxWidth().background(Color(0xFF171719)).padding(horizontal = 12.dp, vertical = 10.dp), verticalAlignment = Alignment.CenterVertically) {
+        Row(Modifier.fillMaxWidth().background(Color(0xFF171719)).padding(horizontal = 12.dp, vertical = if (isLandscape) 2.dp else 10.dp), verticalAlignment = Alignment.CenterVertically) {
             IconButton(onClick = onClose) { Icon(Icons.Default.ArrowBack, "Voltar", tint = Ink) }
             Column(Modifier.padding(start = 4.dp)) { Text(source.title, color = Ink, fontWeight = FontWeight.SemiBold, maxLines = 1); Text("Episódio ${source.episode} · áudio original · legenda selecionada", color = Muted, fontSize = 10.sp) }
             Spacer(Modifier.weight(1f))
@@ -573,7 +618,16 @@ private fun NativePlayer(source: PlaybackSource, onClose: () -> Unit, modifier: 
             }
         }
         Box(Modifier.fillMaxWidth().weight(1f), contentAlignment = Alignment.Center) {
-            AndroidView(factory = { viewContext -> PlayerView(viewContext).apply { this.player = player; useController = true } }, modifier = Modifier.fillMaxWidth().aspectRatio(16f / 9f))
+            AndroidView(
+                factory = { viewContext -> PlayerView(viewContext).apply {
+                    this.player = player
+                    useController = true
+                    resizeMode = androidx.media3.ui.AspectRatioFrameLayout.RESIZE_MODE_FIT
+                    applySubtitlePreferences(this, isLandscape, subtitleSize, subtitleColor, subtitleFont, subtitleBackground)
+                } },
+                update = { view -> applySubtitlePreferences(view, isLandscape, subtitleSize, subtitleColor, subtitleFont, subtitleBackground) },
+                modifier = Modifier.fillMaxSize(),
+            )
             playbackError.value?.let { message ->
                 val compactActions = LocalConfiguration.current.screenWidthDp < 380
                 Column(Modifier.fillMaxWidth().padding(horizontal = 28.dp).clip(RoundedCornerShape(18.dp)).background(Color(0xE5222227)).padding(20.dp), horizontalAlignment = Alignment.CenterHorizontally) {
@@ -591,6 +645,33 @@ private fun NativePlayer(source: PlaybackSource, onClose: () -> Unit, modifier: 
                 }
             }
         }
-        Text("A reprodução usa a fonte disponível para este episódio.", Modifier.align(Alignment.CenterHorizontally).padding(bottom = 24.dp), color = Muted, fontSize = 11.sp)
+        if (!isLandscape) Text("A reprodução usa a fonte disponível para este episódio.", Modifier.align(Alignment.CenterHorizontally).padding(bottom = 24.dp), color = Muted, fontSize = 11.sp)
+    }
+}
+
+private fun applySubtitlePreferences(view: PlayerView, isLandscape: Boolean, size: String, color: String, font: String, background: String) {
+    view.resizeMode = androidx.media3.ui.AspectRatioFrameLayout.RESIZE_MODE_FIT
+    val foregroundColor = when (color) {
+        "yellow" -> android.graphics.Color.YELLOW
+        "cyan" -> android.graphics.Color.CYAN
+        "green" -> android.graphics.Color.GREEN
+        else -> android.graphics.Color.WHITE
+    }
+    val backgroundColor = when (background) {
+        "none" -> android.graphics.Color.TRANSPARENT
+        "dark" -> 0xE6000000.toInt()
+        else -> 0x99000000.toInt()
+    }
+    val typeface = when (font) {
+        "serif" -> Typeface.SERIF
+        "mono" -> Typeface.MONOSPACE
+        else -> Typeface.SANS_SERIF
+    }
+    view.subtitleView?.apply {
+        setApplyEmbeddedStyles(false)
+        setApplyEmbeddedFontSizes(false)
+        setStyle(CaptionStyleCompat(foregroundColor, backgroundColor, android.graphics.Color.TRANSPARENT, CaptionStyleCompat.EDGE_TYPE_OUTLINE, android.graphics.Color.BLACK, typeface))
+        setFractionalTextSize(when (size) { "small" -> 0.043f; "large" -> 0.066f; else -> 0.0533f })
+        setBottomPaddingFraction(if (isLandscape) 0.18f else 0.10f)
     }
 }
