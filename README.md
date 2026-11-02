@@ -125,6 +125,12 @@ O guia de episódios exibe o progresso salvo neste navegador e permite filtrar a
   <img src="docs/screenshots/episodes-mobile.png" width="28%" alt="Seletor de episódios adaptado para celular">
 </p>
 
+#### Aplicativo Android nativo
+
+<p align="center">
+  <img src="docs/screenshots/android-home-mobile.png" width="32%" alt="Mockup da versão Android em celular, com busca, destaque, catálogo e navegação inferior">
+</p>
+
 Requisitos para a interface web: Python 3, fzf, curl, grep e sed, além de um navegador moderno com reprodução HLS. O `mpv` é necessário para reproduzir pelo terminal. Instale Python 3 e as dependências usando o gerenciador de pacotes do seu sistema. Por exemplo, no Arch Linux/CachyOS:
 
 ```bash
@@ -148,3 +154,20 @@ Execute os testes automatizados da interface/servidor com:
 ```bash
 python3 -m unittest discover -s web/tests -v
 ```
+
+## Aplicativo Android nativo
+
+O repositório também contém o projeto Android em Kotlin em [`android-app/`](./android-app/). Ele é independente da interface web e do servidor local: consulta o catálogo no próprio aparelho, mantém favoritos e histórico no armazenamento local, prioriza legendas PT-BR com fallback para português e inglês e reproduz HLS no player Android. Sinopses e títulos de episódios usam tradução automática via MyMemory quando disponível; o texto público do catálogo é enviado ao serviço para tradução, sujeito à disponibilidade e à cota diária anônima.
+
+Baixe e instale a versão de depuração para Android 8.0 ou mais recente: [**Baixar APK ani-cli-pt 0.1.0**](https://github.com/kauessilvas/ani-cli-pt/raw/refs/heads/ani-cli-pt/android-app/ani-cli-pt-0.1.0-debug.apk). Este APK é uma prévia para testes, assinada com a chave de depuração do Android.
+
+Para abrir o projeto, use o Android Studio e selecione a pasta `android-app`. Na primeira abertura, o Gradle baixa as dependências do projeto e o Android Studio configura o SDK. Conecte um aparelho Android com depuração USB ativada ou crie um emulador e execute a configuração `app`.
+
+Também é possível gerar o APK de depuração pela linha de comando, com JDK 17 e Android SDK instalados e configurados:
+
+```bash
+cd android-app
+./gradlew assembleDebug
+```
+
+O APK será criado em `app/build/outputs/apk/debug/app-debug.apk`. O app busca fontes diretamente no HiAnime, então a disponibilidade do catálogo, dos episódios, das legendas e da reprodução depende do provedor e pode mudar.
