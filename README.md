@@ -54,13 +54,13 @@ Abra o menu de busca:
 Ou passe o título diretamente:
 
 ```bash
-./ani-cli "Attack on Titan"
+./ani-cli "Título do anime"
 ```
 
 Para selecionar o primeiro resultado e começar pelo episódio 1:
 
 ```bash
-./ani-cli -S 1 -e 1 "Attack on Titan"
+./ani-cli -S 1 -e 1 "Título do anime"
 ```
 
 Consulte todas as opções disponíveis:
@@ -74,8 +74,8 @@ Consulte todas as opções disponíveis:
 | Comando | Ação |
 | --- | --- |
 | `./ani-cli --dub` | Reproduz a versão dublada, quando disponível |
-| `./ani-cli -q 1080 "Naruto"` | Solicita vídeo em 1080p |
-| `./ani-cli -d "Naruto"` | Baixa o episódio no diretório atual |
+| `./ani-cli -q 1080 "Título do anime"` | Solicita vídeo em 1080p |
+| `./ani-cli -d "Título do anime"` | Baixa o episódio no diretório atual |
 | `./ani-cli --vlc` | Usa o VLC como player |
 | `./ani-cli -c` | Continua a partir do histórico |
 
@@ -114,7 +114,7 @@ A home destaca o anime mais bem colocado na lista atual de séries em exibição
 As capturas abaixo mostram a interface no tema escuro. Na home, o destaque vem do topo da lista atual de animes em exibição; o carrossel mostra outros títulos da temporada.
 
 <p align="center">
-  <img src="docs/screenshots/home-desktop.png" width="68%" alt="Home do ani-cli-pt em desktop, com One Piece em destaque e carrossel de animes da temporada">
+  <img src="docs/screenshots/home-desktop.png" width="68%" alt="Home do ani-cli-pt em desktop, com anime em destaque e carrossel de títulos da temporada">
   <img src="docs/screenshots/home-mobile.png" width="28%" alt="Home do ani-cli-pt adaptada para celular">
 </p>
 
