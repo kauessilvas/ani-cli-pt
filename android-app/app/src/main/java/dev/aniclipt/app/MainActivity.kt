@@ -715,7 +715,7 @@ private fun SettingsScreen(
                 }
             }
         }
-        Text("ani-cli-pt · 0.1.2", color = Muted, fontSize = 11.sp, modifier = Modifier.align(Alignment.CenterHorizontally).padding(vertical = 24.dp))
+        Text("ani-cli-pt · 0.1.3", color = Muted, fontSize = 11.sp, modifier = Modifier.align(Alignment.CenterHorizontally).padding(vertical = 24.dp))
     }
 }
 

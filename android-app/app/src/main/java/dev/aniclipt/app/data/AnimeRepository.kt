@@ -272,7 +272,7 @@ class AnimeRepository {
         const val BASE = "https://hianime.at"
         private const val OPEN_SUBTITLES_BASE = "https://api.opensubtitles.com/api/v1"
         private const val USER_AGENT = "Mozilla/5.0 (Linux; Android 14; Pixel 8) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.0.0 Mobile Safari/537.36"
-        private const val OPEN_SUBTITLES_USER_AGENT = "ani-cli-pt v0.1.2"
+        private const val OPEN_SUBTITLES_USER_AGENT = "ani-cli-pt v0.1.3"
         private val translationCache = java.util.concurrent.ConcurrentHashMap<String, String>()
     }
 }
