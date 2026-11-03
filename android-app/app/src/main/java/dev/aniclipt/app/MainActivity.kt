@@ -55,6 +55,7 @@ import androidx.compose.ui.draw.clip
 import androidx.compose.ui.draw.shadow
 import androidx.compose.ui.graphics.Brush
 import androidx.compose.ui.graphics.Color
+import androidx.compose.ui.graphics.Shadow
 import androidx.compose.ui.layout.ContentScale
 import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.platform.LocalConfiguration
@@ -66,6 +67,8 @@ import androidx.compose.ui.text.input.VisualTransformation
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import androidx.compose.ui.viewinterop.AndroidView
+import androidx.core.view.WindowInsetsCompat
+import androidx.core.view.WindowInsetsControllerCompat
 import androidx.lifecycle.compose.LocalLifecycleOwner
 import androidx.media3.common.C
 import androidx.media3.common.MediaItem
@@ -313,9 +316,9 @@ private fun AnimeHome() {
     var subtitleSize by remember { mutableStateOf(prefs.getString("subtitle_size", "medium") ?: "medium") }
     var subtitleColor by remember { mutableStateOf(prefs.getString("subtitle_color", "white") ?: "white") }
     var subtitleFont by remember { mutableStateOf(prefs.getString("subtitle_font", "sans") ?: "sans") }
-    var subtitleBackground by remember { mutableStateOf(prefs.getString("subtitle_background", "translucent") ?: "translucent") }
+    var subtitleBackground by remember { mutableStateOf(prefs.getString("subtitle_background", "none") ?: "none") }
     var subtitleOutlineColor by remember { mutableStateOf(prefs.getString("subtitle_outline_color", "black") ?: "black") }
-    var subtitleOutlineThickness by remember { mutableStateOf(prefs.getString("subtitle_outline_thickness", "medium") ?: "medium") }
+    var subtitleOutlineThickness by remember { mutableStateOf(prefs.getString("subtitle_outline_thickness", "thick") ?: "thick") }
     var subtitlePosition by remember { mutableStateOf(prefs.getString("subtitle_position", "bottom") ?: "bottom") }
     var openSubtitlesApiKey by remember { mutableStateOf(prefs.getString("opensubtitles_api_key", "") ?: "") }
     var apiKeyValidation by remember { mutableStateOf(ApiKeyValidation.UNKNOWN) }
@@ -906,6 +909,8 @@ private fun SettingsScreen(
         }
         Text("APARÊNCIA DAS LEGENDAS", color = Muted, fontSize = 10.sp, fontWeight = FontWeight.Bold, letterSpacing = 1.3.sp, modifier = Modifier.padding(start = 4.dp, top = 22.dp, bottom = 8.dp))
         Column(Modifier.fillMaxWidth().clip(RoundedCornerShape(18.dp)).background(Color(0xB8202024)).border(1.dp, Color.White.copy(.08f), RoundedCornerShape(18.dp)).padding(horizontal = 16.dp)) {
+            SubtitlePreview(subtitleSize, subtitleColor, subtitleFont, subtitleBackground, subtitleOutlineColor, subtitleOutlineThickness, subtitlePosition)
+            HorizontalDivider(color = Color.White.copy(.08f))
             SubtitlePreferenceRow("Tamanho", subtitleSize, listOf("small" to "Pequeno", "medium" to "Médio", "large" to "Grande"), onSubtitleSize)
             HorizontalDivider(color = Color.White.copy(.08f))
             SubtitlePreferenceRow("Cor do texto", subtitleColor, listOf("white" to "Branco", "yellow" to "Amarelo", "cyan" to "Ciano", "green" to "Verde"), onSubtitleColor)
@@ -1011,7 +1016,7 @@ private fun SettingsScreen(
                 }
             }
         }
-        Text("ani-cli-pt · 0.1.3", color = Muted, fontSize = 11.sp, modifier = Modifier.align(Alignment.CenterHorizontally).padding(vertical = 24.dp))
+        Text("ani-cli-pt · 0.1.6", color = Muted, fontSize = 11.sp, modifier = Modifier.align(Alignment.CenterHorizontally).padding(vertical = 24.dp))
     }
 }
 
@@ -1030,6 +1035,58 @@ private fun SubtitlePreferenceRow(title: String, selected: String, options: List
                 }
             }
         }
+    }
+}
+
+@Composable
+private fun SubtitlePreview(size: String, color: String, font: String, backgroundMode: String, outlineColor: String, outlineThickness: String, position: String) {
+    val foreground = when (color) {
+        "yellow" -> Color(0xFFFFD60A)
+        "cyan" -> Color.Cyan
+        "green" -> Color(0xFF30D158)
+        else -> Color.White
+    }
+    val outline = when (outlineColor) {
+        "white" -> Color.White
+        "blue" -> Color(0xFF0A84FF)
+        "yellow" -> Color(0xFFFFD60A)
+        "red" -> Color(0xFFFF453A)
+        else -> Color.Black
+    }
+    val background = when (backgroundMode) {
+        "dark" -> Color.Black.copy(alpha = .9f)
+        "translucent" -> Color.Black.copy(alpha = .55f)
+        else -> Color.Transparent
+    }
+    val typeface = when (font) {
+        "serif" -> androidx.compose.ui.text.font.FontFamily.Serif
+        "mono" -> androidx.compose.ui.text.font.FontFamily.Monospace
+        else -> androidx.compose.ui.text.font.FontFamily.SansSerif
+    }
+    val outlineDp = when (outlineThickness) { "thin" -> 1.dp; "thick" -> 3.dp; "none" -> 0.dp; else -> 2.dp }
+    val density = androidx.compose.ui.platform.LocalDensity.current
+    val previewAlignment = when (position) {
+        "top" -> Alignment.TopCenter
+        "center" -> Alignment.Center
+        else -> Alignment.BottomCenter
+    }
+    Box(
+        Modifier.fillMaxWidth().padding(vertical = 12.dp).height(112.dp).clip(RoundedCornerShape(14.dp))
+            .background(Brush.verticalGradient(listOf(Color(0xFF30343B), Color(0xFF151619)))),
+    ) {
+        Text(
+            "Uma aventura começa aqui",
+            modifier = Modifier.align(previewAlignment).padding(10.dp).clip(RoundedCornerShape(6.dp))
+                .background(background).padding(horizontal = 8.dp, vertical = 4.dp),
+            color = foreground,
+            fontFamily = typeface,
+            fontSize = when (size) { "small" -> 14.sp; "large" -> 19.sp; else -> 16.sp },
+            maxLines = 1,
+            style = androidx.compose.ui.text.TextStyle(
+                shadow = if (outlineDp == 0.dp) null else Shadow(outline, blurRadius = with(density) { outlineDp.toPx() }),
+            ),
+        )
+        Text("PRÉVIA", Modifier.align(Alignment.TopStart).padding(9.dp), color = Color.White.copy(.55f), fontSize = 9.sp, fontWeight = FontWeight.Bold, letterSpacing = 1.sp)
     }
 }
 
@@ -1141,6 +1198,18 @@ private fun NativePlayer(source: PlaybackSource, anime: Anime?, episode: Episode
     var controlsVisible by remember(source.videoUrl) { mutableStateOf(true) }
     var isPlaying by remember(source.videoUrl) { mutableStateOf(false) }
     var subtitleCueText by remember(source.videoUrl) { mutableStateOf("") }
+    val insetsController = remember(activity, source.videoUrl) {
+        activity?.window?.let { WindowInsetsControllerCompat(it, it.decorView) }
+    }
+    DisposableEffect(insetsController) {
+        insetsController?.systemBarsBehavior = WindowInsetsControllerCompat.BEHAVIOR_SHOW_TRANSIENT_BARS_BY_SWIPE
+        insetsController?.hide(WindowInsetsCompat.Type.statusBars())
+        onDispose { insetsController?.show(WindowInsetsCompat.Type.systemBars()) }
+    }
+    SideEffect {
+        if (isLandscape) insetsController?.show(WindowInsetsCompat.Type.navigationBars())
+        else insetsController?.hide(WindowInsetsCompat.Type.navigationBars())
+    }
     val selectedHeight = quality.removeSuffix("p").toIntOrNull()?.takeIf { it in source.availableVideoHeights }
     val currentWatchProgressCallback by rememberUpdatedState(onWatchProgress)
     val player = remember(source.videoUrl) {
@@ -1270,7 +1339,7 @@ private fun NativePlayer(source: PlaybackSource, anime: Anime?, episode: Episode
                 update = { view ->
                     view.text = subtitleCueText
                     view.visibility = if (subtitleCueText.isBlank()) android.view.View.GONE else android.view.View.VISIBLE
-                    applySubtitleOverlayStyle(view, context, configuration.screenHeightDp, subtitleSize, subtitleColor, subtitleFont, subtitleBackground, subtitleOutlineColor, subtitleOutlineThickness)
+                    applySubtitleOverlayStyle(view, context, minOf(configuration.screenWidthDp, configuration.screenHeightDp), subtitleSize, subtitleColor, subtitleFont, subtitleBackground, subtitleOutlineColor, subtitleOutlineThickness)
                 },
                 modifier = Modifier.align(subtitleAlignment).fillMaxWidth().wrapContentHeight()
                     .padding(horizontal = 22.dp)
@@ -1371,7 +1440,7 @@ private class OutlinedSubtitleTextView(context: android.content.Context) : TextV
 private fun applySubtitleOverlayStyle(
     view: OutlinedSubtitleTextView,
     context: android.content.Context,
-    screenHeightDp: Int,
+    shortestScreenDp: Int,
     size: String,
     color: String,
     font: String,
@@ -1403,14 +1472,14 @@ private fun applySubtitleOverlayStyle(
         else -> Typeface.SANS_SERIF
     }
     val density = context.resources.displayMetrics.density
-    val fractionalSize = when (size) { "small" -> 0.043f; "large" -> 0.066f; else -> 0.0533f }
+    val fractionalSize = when (size) { "small" -> 0.04f; "large" -> 0.06f; else -> 0.05f }
     view.apply {
         gravity = Gravity.CENTER
         maxLines = 3
         includeFontPadding = false
         setTextColor(foregroundColor)
         setTypeface(typeface)
-        setTextSize(TypedValue.COMPLEX_UNIT_PX, screenHeightDp * density * fractionalSize)
+        setTextSize(TypedValue.COMPLEX_UNIT_PX, shortestScreenDp * density * fractionalSize)
         outlineColor = outlineColorInt
         outlineWidthPx = when (outlineThickness) {
             "thin" -> density

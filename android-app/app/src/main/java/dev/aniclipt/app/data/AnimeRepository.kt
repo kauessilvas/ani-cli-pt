@@ -27,14 +27,20 @@ data class Episode(val id: String, val number: String, val title: String, val or
 data class PlaybackSource(val videoUrl: String, val subtitleUrl: String?, val referer: String, val title: String, val episode: String, val audioLabel: String, val subtitleLabel: String, val availableVideoHeights: List<Int> = emptyList())
 
 class AnimeRepository {
-    suspend fun airing(): List<Anime> = withContext(Dispatchers.IO) { parseCatalog(fetch("$BASE/top-airing")) }
+    suspend fun airing(): List<Anime> = withContext(Dispatchers.IO) {
+        translateCatalog(parseCatalog(fetch("$BASE/top-airing")))
+    }
 
     suspend fun search(query: String): List<Anime> = withContext(Dispatchers.IO) {
         val aliases = titleSearchAliases[normalizeMatchText(query)].orEmpty()
         coroutineScope {
-            (aliases + query).distinctBy(::normalizeMatchText).take(3).map { searchTerm ->
-                async { searchHiAnime(searchTerm) }
+            val catalogs = (aliases + query).distinctBy(::normalizeMatchText).take(3).map { searchTerm ->
+                async {
+                    val encoded = URLEncoder.encode(searchTerm, Charsets.UTF_8.name())
+                    parseCatalog(fetch("$BASE/search?keyword=$encoded"))
+                }
             }.awaitAll().flatten().distinctBy { it.slug }.take(36)
+            translateCatalog(catalogs)
         }
     }
 
@@ -58,11 +64,6 @@ class AnimeRepository {
         } finally {
             request.disconnect()
         }
-    }
-
-    private suspend fun searchHiAnime(query: String): List<Anime> {
-        val encoded = URLEncoder.encode(query, Charsets.UTF_8.name())
-        return parseCatalog(fetch("$BASE/search?keyword=$encoded"))
     }
 
     suspend fun episodes(anime: Anime): List<Episode> = withContext(Dispatchers.IO) {
@@ -376,8 +377,8 @@ class AnimeRepository {
         }
     }
 
-    private suspend fun parseCatalog(html: String): List<Anime> = coroutineScope {
-        val parsed = Jsoup.parse(html).select(".flw-item").mapNotNull { card ->
+    private fun parseCatalog(html: String): List<Anime> =
+        Jsoup.parse(html).select(".flw-item").mapNotNull { card ->
             val link = card.selectFirst("a.dynamic-name") ?: return@mapNotNull null
             val slug = URI(BASE).resolve(link.attr("href")).path.trim('/')
             val title = link.text().ifBlank { link.attr("title") }
@@ -386,10 +387,13 @@ class AnimeRepository {
             val poster = image?.attr("data-src").orEmpty().ifBlank { image?.attr("src").orEmpty() }
             Anime(slug, title, poster, synopsis = card.selectFirst(".description")?.text().orEmpty().take(500), metadata = card.select(".fdi-item").map { it.text() }.take(4))
         }.distinctBy { it.slug }.take(36)
+
+    private suspend fun translateCatalog(anime: List<Anime>): List<Anime> = coroutineScope {
+        val distinctDescriptions = anime.asSequence().map { it.synopsis }.filter { it.isNotBlank() }.distinct().toList()
         val semaphore = Semaphore(4)
-        parsed.map { anime ->
-            async { semaphore.withPermit { anime.copy(synopsis = translatePtBr(anime.synopsis)) } }
-        }.awaitAll()
+        val translations = distinctDescriptions.map { text -> async { text to semaphore.withPermit { translatePtBr(text) } } }
+            .awaitAll().toMap()
+        anime.map { item -> item.copy(synopsis = translations[item.synopsis] ?: item.synopsis) }
     }
 
     private fun translatePtBr(text: String): String {
@@ -400,7 +404,10 @@ class AnimeRepository {
             val response = org.json.JSONObject(fetch("https://api.mymemory.translated.net/get?q=$query&langpair=en|pt-BR", "https://mymemory.translated.net/"))
             val translated = response.optJSONObject("responseData")?.optString("translatedText").orEmpty()
             (if (response.optInt("responseStatus") == 200 && translated.isNotBlank()) translated else text).also { translationCache[text] = it }
-        }.getOrDefault(text)
+        }.getOrElse {
+            translationCache.putIfAbsent(text, text)
+            text
+        }
     }
 
     private fun seasonFamily(title: String): String = title.lowercase()
@@ -437,7 +444,7 @@ class AnimeRepository {
         const val BASE = "https://hianime.at"
         private const val OPEN_SUBTITLES_BASE = "https://api.opensubtitles.com/api/v1"
         private const val USER_AGENT = "Mozilla/5.0 (Linux; Android 14; Pixel 8) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.0.0 Mobile Safari/537.36"
-        private const val OPEN_SUBTITLES_USER_AGENT = "ani-cli-pt v0.1.3"
+        private const val OPEN_SUBTITLES_USER_AGENT = "ani-cli-pt v0.1.6"
         private const val MIN_SERIES_TITLE_MATCH = 0.5
         private const val MIN_SUBTITLE_DURATION_RATIO = 0.60
         private const val MAX_SUBTITLE_DURATION_RATIO = 1.15
