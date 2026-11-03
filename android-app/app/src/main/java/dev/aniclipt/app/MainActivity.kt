@@ -3,11 +3,15 @@ package dev.aniclipt.app
 import android.os.Bundle
 import android.Manifest
 import android.app.Activity
+import android.content.Intent
 import android.graphics.Typeface
+import android.net.Uri
 import android.content.pm.ActivityInfo
 import android.content.res.Configuration
 import android.content.pm.PackageManager
 import android.os.Build
+import android.provider.Settings
+import android.widget.Toast
 import androidx.activity.ComponentActivity
 import androidx.activity.compose.BackHandler
 import androidx.activity.compose.setContent
@@ -44,6 +48,7 @@ import androidx.compose.ui.platform.LocalConfiguration
 import androidx.compose.ui.platform.LocalFocusManager
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.input.ImeAction
+import androidx.compose.ui.text.input.PasswordVisualTransformation
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import androidx.compose.ui.viewinterop.AndroidView
@@ -66,10 +71,13 @@ import kotlinx.coroutines.launch
 import androidx.activity.compose.rememberLauncherForActivityResult
 import androidx.activity.result.contract.ActivityResultContracts
 import androidx.core.content.ContextCompat
+import androidx.core.content.FileProvider
+import androidx.core.content.pm.PackageInfoCompat
 import androidx.work.ExistingPeriodicWorkPolicy
 import androidx.work.PeriodicWorkRequestBuilder
 import androidx.work.WorkManager
 import java.util.concurrent.TimeUnit
+import java.io.File
 
 private val Ink = Color(0xFFF5F5F7)
 private val Muted = Color(0xFF9A9AA2)
@@ -78,11 +86,112 @@ private val Panel = Color(0xFF202024)
 private val Accent = Color(0xFF0A84FF)
 
 class MainActivity : ComponentActivity() {
+    private var activityIsResumed = false
+
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
+        getSharedPreferences("ani-cli-pt", MODE_PRIVATE).edit()
+            .remove("opensubtitles_username")
+            .remove("opensubtitles_password")
+            .apply()
         window.statusBarColor = android.graphics.Color.rgb(17, 17, 19)
         window.navigationBarColor = android.graphics.Color.rgb(17, 17, 19)
         setContent { AniCliTheme { AnimeHome() } }
+        removeInstalledUpdateFile()
+    }
+
+    override fun onResume() {
+        super.onResume()
+        activityIsResumed = true
+        processPendingUpdateInstall()
+    }
+
+    override fun onPause() {
+        activityIsResumed = false
+        super.onPause()
+    }
+
+    override fun onNewIntent(intent: Intent) {
+        super.onNewIntent(intent)
+        setIntent(intent)
+        if (activityIsResumed) processPendingUpdateInstall()
+    }
+
+    private fun processPendingUpdateInstall() {
+        val prefs = getSharedPreferences("ani-cli-pt", MODE_PRIVATE)
+        val launchRequested = intent?.getBooleanExtra(EXTRA_INSTALL_UPDATE, false) == true
+        val permissionPending = prefs.getBoolean(ReleaseUpdateWorker.PREF_AWAITING_INSTALL_PERMISSION, false)
+        if (!launchRequested && !permissionPending) return
+        intent?.removeExtra(EXTRA_INSTALL_UPDATE)
+
+        val apk = prefs.getString(ReleaseUpdateWorker.PREF_PENDING_APK, null)?.let(::File)
+        if (apk == null || !apk.isFile) {
+            prefs.edit().remove(ReleaseUpdateWorker.PREF_AWAITING_INSTALL_PERMISSION).apply()
+            Toast.makeText(this, "O APK de atualização não está mais disponível. Tente novamente mais tarde.", Toast.LENGTH_LONG).show()
+            return
+        }
+
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O && !packageManager.canRequestPackageInstalls()) {
+            if (launchRequested) {
+                prefs.edit().putBoolean(ReleaseUpdateWorker.PREF_AWAITING_INSTALL_PERMISSION, true).apply()
+                startActivity(Intent(Settings.ACTION_MANAGE_UNKNOWN_APP_SOURCES, Uri.parse("package:$packageName")))
+            } else {
+                prefs.edit().putBoolean(ReleaseUpdateWorker.PREF_AWAITING_INSTALL_PERMISSION, false).apply()
+                Toast.makeText(this, "Permita instalações do ani-cli-pt e toque no aviso novamente.", Toast.LENGTH_LONG).show()
+            }
+            return
+        }
+
+        prefs.edit().putBoolean(ReleaseUpdateWorker.PREF_AWAITING_INSTALL_PERMISSION, false).apply()
+        runCatching {
+            val uri = FileProvider.getUriForFile(this, "$packageName.fileprovider", apk)
+            startActivity(Intent(Intent.ACTION_VIEW).apply {
+                setDataAndType(uri, APK_MIME_TYPE)
+                addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION or Intent.FLAG_ACTIVITY_NEW_TASK)
+            })
+        }.onFailure {
+            Toast.makeText(this, "Não foi possível abrir o instalador do Android.", Toast.LENGTH_LONG).show()
+        }
+    }
+
+    fun installPendingUpdateNow() {
+        val installIntent = (intent ?: Intent(this, MainActivity::class.java)).putExtra(EXTRA_INSTALL_UPDATE, true)
+        setIntent(installIntent)
+        processPendingUpdateInstall()
+    }
+
+    @Suppress("DEPRECATION")
+    private fun removeInstalledUpdateFile() {
+        val prefs = getSharedPreferences("ani-cli-pt", MODE_PRIVATE)
+        val pendingVersion = prefs.getString(ReleaseUpdateWorker.PREF_PENDING_VERSION, null) ?: return
+        val installed = packageManager.getPackageInfo(packageName, 0)
+        val installedVersion = installed.versionName.orEmpty()
+        if (compareVersionNumbers(installedVersion, pendingVersion) >= 0) {
+            prefs.getString(ReleaseUpdateWorker.PREF_PENDING_APK, null)?.let(::File)?.delete()
+            intent?.removeExtra(EXTRA_INSTALL_UPDATE)
+            prefs.edit()
+                .remove(ReleaseUpdateWorker.PREF_PENDING_APK)
+                .remove(ReleaseUpdateWorker.PREF_PENDING_VERSION)
+                .remove(ReleaseUpdateWorker.PREF_AWAITING_INSTALL_PERMISSION)
+                .remove(ReleaseUpdateWorker.PREF_AVAILABLE_VERSION)
+                .remove(ReleaseUpdateWorker.PREF_DOWNLOAD_STATUS)
+                .apply()
+        }
+    }
+
+    private fun compareVersionNumbers(first: String, second: String): Int {
+        val a = Regex("\\d+").findAll(first).map { it.value.toIntOrNull() ?: 0 }.toList()
+        val b = Regex("\\d+").findAll(second).map { it.value.toIntOrNull() ?: 0 }.toList()
+        for (index in 0 until maxOf(a.size, b.size)) {
+            val result = a.getOrElse(index) { 0 }.compareTo(b.getOrElse(index) { 0 })
+            if (result != 0) return result
+        }
+        return 0
+    }
+
+    companion object {
+        const val EXTRA_INSTALL_UPDATE = "dev.aniclipt.app.INSTALL_UPDATE"
+        private const val APK_MIME_TYPE = "application/vnd.android.package-archive"
     }
 }
 
@@ -113,6 +222,20 @@ private fun AnimeHome() {
     val repository = remember { AnimeRepository() }
     val prefs = remember { context.getSharedPreferences("ani-cli-pt", 0) }
     val scope = rememberCoroutineScope()
+    var availableUpdateVersion by remember { mutableStateOf(prefs.getString(ReleaseUpdateWorker.PREF_AVAILABLE_VERSION, null)) }
+    var pendingUpdateVersion by remember { mutableStateOf(prefs.getString(ReleaseUpdateWorker.PREF_PENDING_VERSION, null)) }
+    var updateDownloadStatus by remember { mutableStateOf(prefs.getString(ReleaseUpdateWorker.PREF_DOWNLOAD_STATUS, "") ?: "") }
+    DisposableEffect(prefs) {
+        val listener = android.content.SharedPreferences.OnSharedPreferenceChangeListener { sharedPreferences, key ->
+            when (key) {
+                ReleaseUpdateWorker.PREF_AVAILABLE_VERSION -> availableUpdateVersion = sharedPreferences.getString(ReleaseUpdateWorker.PREF_AVAILABLE_VERSION, null)
+                ReleaseUpdateWorker.PREF_PENDING_VERSION -> pendingUpdateVersion = sharedPreferences.getString(ReleaseUpdateWorker.PREF_PENDING_VERSION, null)
+                ReleaseUpdateWorker.PREF_DOWNLOAD_STATUS -> updateDownloadStatus = sharedPreferences.getString(ReleaseUpdateWorker.PREF_DOWNLOAD_STATUS, "") ?: ""
+            }
+        }
+        prefs.registerOnSharedPreferenceChangeListener(listener)
+        onDispose { prefs.unregisterOnSharedPreferenceChangeListener(listener) }
+    }
     var airing by remember { mutableStateOf<List<Anime>>(emptyList()) }
     var featured by remember { mutableStateOf<Anime?>(null) }
     var results by remember { mutableStateOf<List<Anime>>(emptyList()) }
@@ -121,6 +244,8 @@ private fun AnimeHome() {
     var error by remember { mutableStateOf<String?>(null) }
     var selected by remember { mutableStateOf<Anime?>(null) }
     var episodes by remember { mutableStateOf<List<Episode>>(emptyList()) }
+    var seasonOptions by remember { mutableStateOf<List<Anime>>(emptyList()) }
+    var currentSeason by remember { mutableStateOf<Anime?>(null) }
     var chosenEpisode by remember { mutableStateOf<Episode?>(null) }
     var source by remember { mutableStateOf<PlaybackSource?>(null) }
     var dubbed by remember { mutableStateOf(prefs.getBoolean("default_dubbed", false)) }
@@ -129,9 +254,13 @@ private fun AnimeHome() {
     var subtitleColor by remember { mutableStateOf(prefs.getString("subtitle_color", "white") ?: "white") }
     var subtitleFont by remember { mutableStateOf(prefs.getString("subtitle_font", "sans") ?: "sans") }
     var subtitleBackground by remember { mutableStateOf(prefs.getString("subtitle_background", "translucent") ?: "translucent") }
+    var openSubtitlesApiKey by remember { mutableStateOf(prefs.getString("opensubtitles_api_key", "") ?: "") }
+    var openSubtitlesEnabled by remember { mutableStateOf(prefs.getBoolean("opensubtitles_enabled", false)) }
     var favoriteView by remember { mutableStateOf(false) }
     var settingsView by remember { mutableStateOf(false) }
     var notificationsEnabled by remember { mutableStateOf(prefs.getBoolean("episode_notifications", false)) }
+    var automaticUpdatesEnabled by remember { mutableStateOf(prefs.getBoolean(ReleaseUpdateWorker.PREF_ENABLED, false)) }
+    var pendingNotificationFeature by remember { mutableStateOf<String?>(null) }
     var favorites by remember { mutableStateOf(prefs.getStringSet("favorites", emptySet())?.toSet() ?: emptySet()) }
     val savedAnime = remember { mutableStateMapOf<String, Anime>().apply {
         runCatching {
@@ -146,10 +275,20 @@ private fun AnimeHome() {
     var history by remember { mutableStateOf(prefs.getString("history", "") ?: "") }
     val notificationPermission = rememberLauncherForActivityResult(ActivityResultContracts.RequestPermission()) { granted ->
         if (!granted) {
-            notificationsEnabled = false
-            prefs.edit().putBoolean("episode_notifications", false).apply()
-            WorkManager.getInstance(context).cancelUniqueWork("favorite-episode-check")
+            when (pendingNotificationFeature) {
+                "episodes" -> {
+                    notificationsEnabled = false
+                    prefs.edit().putBoolean("episode_notifications", false).apply()
+                    WorkManager.getInstance(context).cancelUniqueWork("favorite-episode-check")
+                }
+                "updates" -> {
+                    automaticUpdatesEnabled = false
+                    prefs.edit().putBoolean(ReleaseUpdateWorker.PREF_ENABLED, false).apply()
+                    ReleaseUpdateWorker.cancel(context)
+                }
+            }
         }
+        pendingNotificationFeature = null
     }
 
     fun setNotificationsEnabled(enabled: Boolean) {
@@ -161,6 +300,7 @@ private fun AnimeHome() {
             return
         }
         if (Build.VERSION.SDK_INT >= 33 && ContextCompat.checkSelfPermission(context, Manifest.permission.POST_NOTIFICATIONS) != PackageManager.PERMISSION_GRANTED) {
+            pendingNotificationFeature = "episodes"
             notificationPermission.launch(Manifest.permission.POST_NOTIFICATIONS)
         }
         FavoriteEpisodeWorker.captureBaseline(context)
@@ -178,8 +318,41 @@ private fun AnimeHome() {
         prefs.edit().putString("favorite_items", array.toString()).apply()
         if (anime.slug in next && notificationsEnabled) FavoriteEpisodeWorker.captureBaseline(context)
     }
+    fun setAutomaticUpdatesEnabled(enabled: Boolean) {
+        automaticUpdatesEnabled = enabled
+        prefs.edit().putBoolean(ReleaseUpdateWorker.PREF_ENABLED, enabled).apply()
+        if (!enabled) {
+            ReleaseUpdateWorker.cancel(context)
+            return
+        }
+        if (Build.VERSION.SDK_INT >= 33 && ContextCompat.checkSelfPermission(context, Manifest.permission.POST_NOTIFICATIONS) != PackageManager.PERMISSION_GRANTED) {
+            pendingNotificationFeature = "updates"
+            notificationPermission.launch(Manifest.permission.POST_NOTIFICATIONS)
+        }
+        ReleaseUpdateWorker.schedule(context)
+        ReleaseUpdateWorker.checkNow(context)
+    }
+    fun downloadUpdate() {
+        updateDownloadStatus = ReleaseUpdateWorker.STATUS_DOWNLOADING
+        prefs.edit().putString(ReleaseUpdateWorker.PREF_DOWNLOAD_STATUS, updateDownloadStatus).apply()
+        ReleaseUpdateWorker.downloadManually(context)
+    }
+    fun openSeason(season: Anime) {
+        currentSeason = season
+        episodes = emptyList()
+        busy = true
+        error = null
+        scope.launch {
+            runCatching { repository.episodes(season) }
+                .onSuccess { episodes = it; if (it.isEmpty()) error = "Nenhum episódio disponível nesta temporada." }
+                .onFailure { error = it.message ?: "Não foi possível carregar esta temporada." }
+            busy = false
+        }
+    }
     fun openAnime(anime: Anime) {
         selected = anime
+        currentSeason = anime
+        seasonOptions = listOf(anime)
         episodes = emptyList()
         chosenEpisode = null
         busy = true
@@ -188,6 +361,11 @@ private fun AnimeHome() {
             launch {
                 if (anime.banner.isBlank()) runCatching { repository.artwork(anime) }.onSuccess { artwork ->
                     if (selected?.slug == anime.slug) selected = artwork
+                }
+            }
+            launch {
+                runCatching { repository.seasons(anime) }.onSuccess { options ->
+                    if (selected?.slug == anime.slug) seasonOptions = options.ifEmpty { listOf(anime) }
                 }
             }
             val episodeResult = runCatching { repository.episodes(anime) }
@@ -213,7 +391,7 @@ private fun AnimeHome() {
         busy = true
         error = null
         scope.launch {
-            runCatching { repository.resolve(anime, episode, dubbed, quality) }
+            runCatching { repository.resolve(anime, episode, dubbed, quality, openSubtitlesEnabled, openSubtitlesApiKey.trim()) }
                 .onSuccess {
                     source = it
                     chosenEpisode = episode
@@ -228,6 +406,10 @@ private fun AnimeHome() {
 
     LaunchedEffect(Unit) {
         if (notificationsEnabled) FavoriteEpisodeWorker.schedule(context)
+        if (automaticUpdatesEnabled) {
+            ReleaseUpdateWorker.schedule(context)
+            ReleaseUpdateWorker.checkNow(context)
+        } else ReleaseUpdateWorker.checkOnLaunch(context)
         focusManager.clearFocus(force = true)
         busy = true
         runCatching { repository.airing() }
@@ -250,7 +432,7 @@ private fun AnimeHome() {
     }
 
     BackHandler(enabled = source != null || selected != null || settingsView) {
-        if (source != null) source = null else if (selected != null) { selected = null; error = null } else settingsView = false
+        if (source != null) source = null else if (selected != null) { selected = null; currentSeason = null; seasonOptions = emptyList(); error = null } else settingsView = false
     }
 
     Box(Modifier.fillMaxSize()) {
@@ -297,6 +479,13 @@ private fun AnimeHome() {
                     onDubbed = { dubbed = it; prefs.edit().putBoolean("default_dubbed", it).apply() },
                     notificationsEnabled = notificationsEnabled,
                     onNotifications = ::setNotificationsEnabled,
+                    automaticUpdatesEnabled = automaticUpdatesEnabled,
+                    onAutomaticUpdates = ::setAutomaticUpdatesEnabled,
+                    availableUpdateVersion = availableUpdateVersion,
+                    pendingUpdateVersion = pendingUpdateVersion,
+                    updateDownloadStatus = updateDownloadStatus,
+                    onDownloadUpdate = ::downloadUpdate,
+                    onInstallUpdate = { (context as? MainActivity)?.installPendingUpdateNow() },
                     subtitleSize = subtitleSize,
                     onSubtitleSize = { subtitleSize = it; prefs.edit().putString("subtitle_size", it).apply() },
                     subtitleColor = subtitleColor,
@@ -305,6 +494,10 @@ private fun AnimeHome() {
                     onSubtitleFont = { subtitleFont = it; prefs.edit().putString("subtitle_font", it).apply() },
                     subtitleBackground = subtitleBackground,
                     onSubtitleBackground = { subtitleBackground = it; prefs.edit().putString("subtitle_background", it).apply() },
+                    openSubtitlesApiKey = openSubtitlesApiKey,
+                    onOpenSubtitlesApiKey = { openSubtitlesApiKey = it; prefs.edit().putString("opensubtitles_api_key", it).apply() },
+                    openSubtitlesEnabled = openSubtitlesEnabled,
+                    onOpenSubtitlesEnabled = { openSubtitlesEnabled = it; prefs.edit().putBoolean("opensubtitles_enabled", it).apply() },
                 )
             } else LazyColumn(Modifier.weight(1f).widthIn(max = 960.dp).align(Alignment.CenterHorizontally), contentPadding = PaddingValues(bottom = 20.dp)) {
                 if (!favoriteView && query.isBlank() && featured != null) {
@@ -343,7 +536,8 @@ private fun AnimeHome() {
     }
 
     if (selected != null && source == null) {
-        EpisodeSheet(anime = selected!!, episodes = episodes, watched = history.split(',').filter { it.isNotBlank() }.toSet(), busy = busy, error = error, dubbed = dubbed, onDubbed = { dubbed = it; prefs.edit().putBoolean("default_dubbed", it).apply() }, quality = quality, onQuality = { quality = it; prefs.edit().putString("quality", it).apply() }, favorites = favorites, onFavorite = { toggleFavorite(selected!!) }, onClose = { selected = null; error = null }, onPlay = { episode -> play(selected!!, episode) })
+        val episodeAnime = currentSeason ?: selected!!
+        EpisodeSheet(anime = episodeAnime, episodes = episodes, watched = history.split(',').filter { it.isNotBlank() }.toSet(), busy = busy, error = error, dubbed = dubbed, onDubbed = { dubbed = it; prefs.edit().putBoolean("default_dubbed", it).apply() }, quality = quality, onQuality = { quality = it; prefs.edit().putString("quality", it).apply() }, favorites = favorites, favoriteSlug = selected!!.slug, onFavorite = { toggleFavorite(selected!!) }, seasons = seasonOptions, onSeasonSelected = ::openSeason, onClose = { selected = null; currentSeason = null; seasonOptions = emptyList(); error = null }, onPlay = { episode -> play(episodeAnime, episode) })
     }
     if (source != null) {
         NativePlayer(source = source!!, onClose = { source = null }, subtitleSize = subtitleSize, subtitleColor = subtitleColor, subtitleFont = subtitleFont, subtitleBackground = subtitleBackground, modifier = Modifier.fillMaxSize())
@@ -407,6 +601,13 @@ private fun SettingsScreen(
     onDubbed: (Boolean) -> Unit,
     notificationsEnabled: Boolean,
     onNotifications: (Boolean) -> Unit,
+    automaticUpdatesEnabled: Boolean,
+    onAutomaticUpdates: (Boolean) -> Unit,
+    availableUpdateVersion: String?,
+    pendingUpdateVersion: String?,
+    updateDownloadStatus: String,
+    onDownloadUpdate: () -> Unit,
+    onInstallUpdate: () -> Unit,
     subtitleSize: String,
     onSubtitleSize: (String) -> Unit,
     subtitleColor: String,
@@ -415,6 +616,10 @@ private fun SettingsScreen(
     onSubtitleFont: (String) -> Unit,
     subtitleBackground: String,
     onSubtitleBackground: (String) -> Unit,
+    openSubtitlesApiKey: String,
+    onOpenSubtitlesApiKey: (String) -> Unit,
+    openSubtitlesEnabled: Boolean,
+    onOpenSubtitlesEnabled: (Boolean) -> Unit,
 ) {
     val qualityOptions = listOf("best" to "Automática (melhor disponível)", "1080p" to "1080p", "720p" to "720p", "480p" to "480p", "360p" to "360p")
     var qualityExpanded by remember { mutableStateOf(false) }
@@ -432,7 +637,7 @@ private fun SettingsScreen(
             }
             HorizontalDivider(color = Color.White.copy(.08f))
             Row(Modifier.fillMaxWidth().padding(vertical = 12.dp), verticalAlignment = Alignment.CenterVertically) {
-                Column(Modifier.weight(1f).padding(end = 10.dp)) { Text("Preferir áudio dublado", fontWeight = FontWeight.SemiBold, fontSize = 14.sp); Text("Desativado: áudio original", color = Muted, fontSize = 11.sp, modifier = Modifier.padding(top = 3.dp)) }
+                Column(Modifier.weight(1f).padding(end = 10.dp)) { Text("Preferir dublagem PT-BR", fontWeight = FontWeight.SemiBold, fontSize = 14.sp); Text("Sem faixa PT-BR identificada: usa áudio original", color = Muted, fontSize = 11.sp, modifier = Modifier.padding(top = 3.dp)) }
                 Switch(checked = dubbed, onCheckedChange = onDubbed)
             }
         }
@@ -446,6 +651,29 @@ private fun SettingsScreen(
             HorizontalDivider(color = Color.White.copy(.08f))
             SubtitlePreferenceRow("Fundo", subtitleBackground, listOf("none" to "Sem fundo", "translucent" to "Translúcido", "dark" to "Escuro"), onSubtitleBackground)
         }
+        Text("BUSCA DE LEGENDAS PT-BR", color = Muted, fontSize = 10.sp, fontWeight = FontWeight.Bold, letterSpacing = 1.3.sp, modifier = Modifier.padding(start = 4.dp, top = 22.dp, bottom = 8.dp))
+        Column(Modifier.fillMaxWidth().clip(RoundedCornerShape(18.dp)).background(Color(0xB8202024)).border(1.dp, Color.White.copy(.08f), RoundedCornerShape(18.dp)).padding(16.dp)) {
+            Text("OpenSubtitles", fontWeight = FontWeight.SemiBold, fontSize = 14.sp)
+            Text("Ative para buscar legendas PT-BR externas quando a fonte do vídeo não tiver uma. Desativado, o app não consulta o OpenSubtitles.", color = Muted, fontSize = 11.sp, modifier = Modifier.padding(top = 4.dp, bottom = 8.dp))
+            Row(Modifier.fillMaxWidth().padding(vertical = 6.dp), verticalAlignment = Alignment.CenterVertically) {
+                Column(Modifier.weight(1f).padding(end = 10.dp)) {
+                    Text("Usar OpenSubtitles", fontWeight = FontWeight.SemiBold, fontSize = 14.sp)
+                    Text(if (openSubtitlesEnabled) "Busca externa ativada" else "Busca externa desativada", color = Muted, fontSize = 11.sp, modifier = Modifier.padding(top = 3.dp))
+                }
+                Switch(checked = openSubtitlesEnabled, onCheckedChange = onOpenSubtitlesEnabled)
+            }
+            OutlinedTextField(
+                value = openSubtitlesApiKey,
+                onValueChange = onOpenSubtitlesApiKey,
+                modifier = Modifier.fillMaxWidth(),
+                singleLine = true,
+                label = { Text("Chave de API") },
+                placeholder = { Text("Insira sua chave OpenSubtitles") },
+                visualTransformation = PasswordVisualTransformation(),
+                colors = OutlinedTextFieldDefaults.colors(focusedTextColor = Ink, unfocusedTextColor = Ink, focusedBorderColor = Accent, unfocusedBorderColor = Color.White.copy(.18f), focusedLabelColor = Accent, unfocusedLabelColor = Muted, cursorColor = Accent),
+            )
+            Text("A chave só é usada quando esta opção está ativada. Sem chave, a busca externa não funciona.", color = Muted, fontSize = 10.sp, modifier = Modifier.padding(top = 6.dp))
+        }
         Text("NOTIFICAÇÕES", color = Muted, fontSize = 10.sp, fontWeight = FontWeight.Bold, letterSpacing = 1.3.sp, modifier = Modifier.padding(start = 4.dp, top = 22.dp, bottom = 8.dp))
         Column(Modifier.fillMaxWidth().clip(RoundedCornerShape(18.dp)).background(Color(0xB8202024)).border(1.dp, Color.White.copy(.08f), RoundedCornerShape(18.dp)).padding(16.dp)) {
             Row(verticalAlignment = Alignment.CenterVertically) {
@@ -453,7 +681,41 @@ private fun SettingsScreen(
                 Switch(checked = notificationsEnabled, onCheckedChange = onNotifications)
             }
         }
-        Text("ani-cli-pt · 0.1.1", color = Muted, fontSize = 11.sp, modifier = Modifier.align(Alignment.CenterHorizontally).padding(vertical = 24.dp))
+        Text("ATUALIZAÇÕES", color = Muted, fontSize = 10.sp, fontWeight = FontWeight.Bold, letterSpacing = 1.3.sp, modifier = Modifier.padding(start = 4.dp, top = 22.dp, bottom = 8.dp))
+        Column(Modifier.fillMaxWidth().clip(RoundedCornerShape(18.dp)).background(Color(0xB8202024)).border(1.dp, Color.White.copy(.08f), RoundedCornerShape(18.dp)).padding(16.dp)) {
+            Row(verticalAlignment = Alignment.CenterVertically) {
+                Column(Modifier.weight(1f).padding(end = 10.dp)) {
+                    Text("Atualizações automáticas", fontWeight = FontWeight.SemiBold, fontSize = 14.sp)
+                    Text("O app sempre verifica ao abrir. Ative para também verificar e baixar em segundo plano. Se houver novidade, você pode baixar por aqui.", color = Muted, fontSize = 11.sp, modifier = Modifier.padding(top = 4.dp))
+                    if (availableUpdateVersion != null) {
+                        Text("Nova versão $availableUpdateVersion disponível.", color = Color(0xFF8FC5FF), fontSize = 12.sp, fontWeight = FontWeight.SemiBold, modifier = Modifier.padding(top = 8.dp))
+                    }
+                    if (pendingUpdateVersion != null) {
+                        Text("Versão $pendingUpdateVersion pronta para instalar.", color = Color(0xFF8FC5FF), fontSize = 12.sp, fontWeight = FontWeight.SemiBold, modifier = Modifier.padding(top = 8.dp))
+                    } else when (updateDownloadStatus) {
+                        ReleaseUpdateWorker.STATUS_DOWNLOADING -> Text("Baixando atualização…", color = Muted, fontSize = 11.sp, modifier = Modifier.padding(top = 8.dp))
+                        ReleaseUpdateWorker.STATUS_FAILED -> Text("Não foi possível baixar. Tente novamente.", color = Color(0xFFFF9B9B), fontSize = 11.sp, modifier = Modifier.padding(top = 8.dp))
+                        ReleaseUpdateWorker.STATUS_UP_TO_DATE -> Text("O app já está na versão mais recente.", color = Muted, fontSize = 11.sp, modifier = Modifier.padding(top = 8.dp))
+                    }
+                }
+                Switch(checked = automaticUpdatesEnabled, onCheckedChange = onAutomaticUpdates)
+            }
+            if (pendingUpdateVersion != null) {
+                Button(onClick = onInstallUpdate, modifier = Modifier.fillMaxWidth().padding(top = 10.dp), colors = ButtonDefaults.buttonColors(containerColor = Accent, contentColor = Color.White)) {
+                    Text("Instalar atualização")
+                }
+            } else if (availableUpdateVersion != null) {
+                Button(
+                    onClick = onDownloadUpdate,
+                    enabled = updateDownloadStatus != ReleaseUpdateWorker.STATUS_DOWNLOADING,
+                    modifier = Modifier.fillMaxWidth().padding(top = 10.dp),
+                    colors = ButtonDefaults.buttonColors(containerColor = Accent, contentColor = Color.White),
+                ) {
+                    Text(if (updateDownloadStatus == ReleaseUpdateWorker.STATUS_FAILED) "Tentar baixar novamente" else "Baixar atualização")
+                }
+            }
+        }
+        Text("ani-cli-pt · 0.1.2", color = Muted, fontSize = 11.sp, modifier = Modifier.align(Alignment.CenterHorizontally).padding(vertical = 24.dp))
     }
 }
 
@@ -480,11 +742,19 @@ private fun qualityLabel(quality: String): String = when (quality) {
     else -> quality
 }
 
+private fun seasonLabel(anime: Anime, seasons: List<Anime>): String {
+    val explicitNumber = Regex("(?:season\\s*(\\d+)|(\\d+)(?:st|nd|rd|th)\\s+season|\\bs\\s*(\\d+)\\b)", RegexOption.IGNORE_CASE)
+        .find(anime.title)?.groupValues?.drop(1)?.firstOrNull { it.isNotBlank() }?.toIntOrNull()
+    val inferredNumber = seasons.indexOfFirst { it.slug == anime.slug }.takeIf { it >= 0 }?.plus(1)
+    return "Temporada ${explicitNumber ?: inferredNumber ?: 1}"
+}
+
 @OptIn(ExperimentalMaterial3Api::class)
 @Composable
-private fun EpisodeSheet(anime: Anime, episodes: List<Episode>, watched: Set<String>, busy: Boolean, error: String?, dubbed: Boolean, onDubbed: (Boolean) -> Unit, quality: String, onQuality: (String) -> Unit, favorites: Set<String>, onFavorite: () -> Unit, onClose: () -> Unit, onPlay: (Episode) -> Unit) {
+private fun EpisodeSheet(anime: Anime, episodes: List<Episode>, watched: Set<String>, busy: Boolean, error: String?, dubbed: Boolean, onDubbed: (Boolean) -> Unit, quality: String, onQuality: (String) -> Unit, favorites: Set<String>, favoriteSlug: String, onFavorite: () -> Unit, seasons: List<Anime>, onSeasonSelected: (Anime) -> Unit, onClose: () -> Unit, onPlay: (Episode) -> Unit) {
     var picked by remember(anime.slug) { mutableStateOf<Episode?>(null) }
     var qualityExpanded by remember { mutableStateOf(false) }
+    var seasonExpanded by remember { mutableStateOf(false) }
     val sheetState = rememberModalBottomSheetState(skipPartiallyExpanded = true)
     val configuration = LocalConfiguration.current
     val landscape = configuration.screenWidthDp > configuration.screenHeightDp
@@ -499,12 +769,29 @@ private fun EpisodeSheet(anime: Anime, episodes: List<Episode>, watched: Set<Str
                     Text(anime.metadata.joinToString(" · "), color = Muted, fontSize = 11.sp)
                     Text(anime.synopsis.ifBlank { "Sinopse não disponível." }, color = Color(0xFFB8B8C0), fontSize = 11.sp, maxLines = if (landscape) 1 else 3, modifier = Modifier.padding(top = 6.dp))
                 }
-                IconButton(onClick = onFavorite) { Icon(if (anime.slug in favorites) Icons.Default.Favorite else Icons.Default.FavoriteBorder, "Favoritar", tint = if (anime.slug in favorites) Color(0xFFFF6B82) else Muted) }
+                IconButton(onClick = onFavorite) { Icon(if (favoriteSlug in favorites) Icons.Default.Favorite else Icons.Default.FavoriteBorder, "Favoritar", tint = if (favoriteSlug in favorites) Color(0xFFFF6B82) else Muted) }
             }
             HorizontalDivider(Modifier.padding(vertical = 14.dp), color = Color(0xFF38383D))
             Row(verticalAlignment = Alignment.CenterVertically) {
                 Column(Modifier.weight(1f)) { Text("GUIA DE EPISÓDIOS", color = Muted, fontSize = 9.sp, fontWeight = FontWeight.Bold, letterSpacing = 1.3.sp); Text("Escolha onde começar", fontWeight = FontWeight.SemiBold, fontSize = 17.sp) }
-                Text("${episodes.size} episódios", color = Muted, fontSize = 11.sp)
+                if (seasons.size > 1) {
+                    Box {
+                        Column(horizontalAlignment = Alignment.End) {
+                            TextButton(onClick = { seasonExpanded = true }, contentPadding = PaddingValues(horizontal = 6.dp, vertical = 0.dp)) {
+                                Text(seasonLabel(anime, seasons), color = Color(0xFFB9D9FF), fontSize = 11.sp, maxLines = 1)
+                            }
+                            Text("${episodes.size} episódios", color = Muted, fontSize = 10.sp)
+                        }
+                        DropdownMenu(expanded = seasonExpanded, onDismissRequest = { seasonExpanded = false }) {
+                            seasons.forEach { season ->
+                                DropdownMenuItem(
+                                    text = { Text(seasonLabel(season, seasons)) },
+                                    onClick = { seasonExpanded = false; if (season.slug != anime.slug) onSeasonSelected(season) },
+                                )
+                            }
+                        }
+                    }
+                } else Text("${episodes.size} episódios", color = Muted, fontSize = 11.sp)
             }
             BoxWithConstraints(Modifier.fillMaxWidth().padding(top = 10.dp)) {
                 val narrow = maxWidth < 380.dp
@@ -513,7 +800,7 @@ private fun EpisodeSheet(anime: Anime, episodes: List<Episode>, watched: Set<Str
                         Row(verticalAlignment = Alignment.CenterVertically) {
                             FilterChip(selected = !dubbed, onClick = { onDubbed(false) }, label = { Text(if (compact) "Original" else "Original · legendado", maxLines = 1) })
                             Spacer(Modifier.width(6.dp))
-                            FilterChip(selected = dubbed, onClick = { onDubbed(true) }, label = { Text("Dublado") })
+                            FilterChip(selected = dubbed, onClick = { onDubbed(true) }, label = { Text(if (compact) "PT-BR" else "Dublado PT-BR") })
                         }
                         Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.End) {
                             Box {
@@ -525,7 +812,7 @@ private fun EpisodeSheet(anime: Anime, episodes: List<Episode>, watched: Set<Str
                 } else Row(verticalAlignment = Alignment.CenterVertically) {
                     FilterChip(selected = !dubbed, onClick = { onDubbed(false) }, label = { Text("Original · legendado", maxLines = 1) })
                     Spacer(Modifier.width(8.dp))
-                    FilterChip(selected = dubbed, onClick = { onDubbed(true) }, label = { Text("Dublado") })
+                    FilterChip(selected = dubbed, onClick = { onDubbed(true) }, label = { Text("Dublado PT-BR") })
                     Spacer(Modifier.weight(1f))
                     Box {
                         TextButton(onClick = { qualityExpanded = true }) { Text("${qualityLabel(quality)} ▾", fontSize = 10.sp) }
@@ -578,8 +865,11 @@ private fun NativePlayer(source: PlaybackSource, onClose: () -> Unit, subtitleSi
         val dataSource = DefaultHttpDataSource.Factory().setDefaultRequestProperties(headers).setAllowCrossProtocolRedirects(true)
         val mediaItem = MediaItem.Builder().setUri(source.videoUrl).apply {
             source.subtitleUrl?.let { subtitle ->
-                val mime = if (subtitle.substringBefore('?').endsWith(".srt", true)) MimeTypes.APPLICATION_SUBRIP else MimeTypes.TEXT_VTT
-                setSubtitleConfigurations(listOf(MediaItem.SubtitleConfiguration.Builder(android.net.Uri.parse(subtitle)).setMimeType(mime).setLanguage("pt-BR").setLabel("Legenda PT-BR / fallback inglês").setSelectionFlags(C.SELECTION_FLAG_DEFAULT).build()))
+                val path = android.net.Uri.parse(subtitle).path.orEmpty()
+                val isSubRip = path.endsWith(".srt", true) || source.subtitleLabel.contains("OpenSubtitles", true)
+                val mime = if (isSubRip) MimeTypes.APPLICATION_SUBRIP else MimeTypes.TEXT_VTT
+                val language = if (source.subtitleLabel.contains("inglês", true)) "en" else "pt-BR"
+                setSubtitleConfigurations(listOf(MediaItem.SubtitleConfiguration.Builder(android.net.Uri.parse(subtitle)).setMimeType(mime).setLanguage(language).setLabel(source.subtitleLabel).setSelectionFlags(C.SELECTION_FLAG_DEFAULT).build()))
             }
         }.build()
         ExoPlayer.Builder(context).setMediaSourceFactory(androidx.media3.exoplayer.source.DefaultMediaSourceFactory(dataSource)).build().apply {
@@ -611,7 +901,7 @@ private fun NativePlayer(source: PlaybackSource, onClose: () -> Unit, subtitleSi
     Column(modifier.background(Color.Black).statusBarsPadding()) {
         Row(Modifier.fillMaxWidth().background(Color(0xFF171719)).padding(horizontal = 12.dp, vertical = if (isLandscape) 2.dp else 10.dp), verticalAlignment = Alignment.CenterVertically) {
             IconButton(onClick = onClose) { Icon(Icons.Default.ArrowBack, "Voltar", tint = Ink) }
-            Column(Modifier.padding(start = 4.dp)) { Text(source.title, color = Ink, fontWeight = FontWeight.SemiBold, maxLines = 1); Text("Episódio ${source.episode} · áudio original · legenda selecionada", color = Muted, fontSize = 10.sp) }
+            Column(Modifier.padding(start = 4.dp)) { Text(source.title, color = Ink, fontWeight = FontWeight.SemiBold, maxLines = 1); Text("Episódio ${source.episode} · ${source.audioLabel} · ${source.subtitleLabel}", color = Muted, fontSize = 10.sp, maxLines = 1) }
             Spacer(Modifier.weight(1f))
             IconButton(onClick = { activity?.requestedOrientation = if (isLandscape) ActivityInfo.SCREEN_ORIENTATION_PORTRAIT else ActivityInfo.SCREEN_ORIENTATION_LANDSCAPE }) {
                 Icon(Icons.Default.ScreenRotation, if (isLandscape) "Voltar para modo retrato" else "Girar para modo paisagem", tint = Ink)
