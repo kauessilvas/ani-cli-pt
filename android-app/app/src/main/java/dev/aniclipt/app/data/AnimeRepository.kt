@@ -4,6 +4,7 @@ import android.util.Base64
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.async
 import kotlinx.coroutines.awaitAll
+import kotlinx.coroutines.coroutineScope
 import kotlinx.coroutines.withContext
 import kotlinx.coroutines.sync.Semaphore
 import kotlinx.coroutines.sync.withPermit
@@ -29,8 +30,39 @@ class AnimeRepository {
     suspend fun airing(): List<Anime> = withContext(Dispatchers.IO) { parseCatalog(fetch("$BASE/top-airing")) }
 
     suspend fun search(query: String): List<Anime> = withContext(Dispatchers.IO) {
+        val aliases = titleSearchAliases[normalizeMatchText(query)].orEmpty()
+        coroutineScope {
+            (aliases + query).distinctBy(::normalizeMatchText).take(3).map { searchTerm ->
+                async { searchHiAnime(searchTerm) }
+            }.awaitAll().flatten().distinctBy { it.slug }.take(36)
+        }
+    }
+
+    suspend fun validateOpenSubtitlesApiKey(apiKey: String): Boolean? = withContext(Dispatchers.IO) {
+        if (apiKey.isBlank()) return@withContext false
+        val request = runCatching { URL("$OPEN_SUBTITLES_BASE/infos/formats").openConnection() as HttpURLConnection }.getOrNull()
+            ?: return@withContext null
+        request.connectTimeout = 10_000
+        request.readTimeout = 10_000
+        request.setRequestProperty("Api-Key", apiKey)
+        request.setRequestProperty("Accept", "application/json")
+        request.setRequestProperty("User-Agent", OPEN_SUBTITLES_USER_AGENT)
+        try {
+            when (request.responseCode) {
+                in 200..299 -> true
+                401, 403 -> false
+                else -> null
+            }
+        } catch (_: Exception) {
+            null
+        } finally {
+            request.disconnect()
+        }
+    }
+
+    private suspend fun searchHiAnime(query: String): List<Anime> {
         val encoded = URLEncoder.encode(query, Charsets.UTF_8.name())
-        parseCatalog(fetch("$BASE/search?keyword=$encoded"))
+        return parseCatalog(fetch("$BASE/search?keyword=$encoded"))
     }
 
     suspend fun episodes(anime: Anime): List<Episode> = withContext(Dispatchers.IO) {
@@ -344,15 +376,21 @@ class AnimeRepository {
         }
     }
 
-    private fun parseCatalog(html: String): List<Anime> = Jsoup.parse(html).select(".flw-item").mapNotNull { card ->
-        val link = card.selectFirst("a.dynamic-name") ?: return@mapNotNull null
-        val slug = URI(BASE).resolve(link.attr("href")).path.trim('/')
-        val title = link.text().ifBlank { link.attr("title") }
-        if (slug.isBlank() || title.isBlank()) return@mapNotNull null
-        val image = card.selectFirst("img.film-poster-img")
-        val poster = image?.attr("data-src").orEmpty().ifBlank { image?.attr("src").orEmpty() }
-        Anime(slug, title, poster, synopsis = card.selectFirst(".description")?.text().orEmpty().take(500), metadata = card.select(".fdi-item").map { it.text() }.take(4))
-    }.distinctBy { it.slug }.take(36)
+    private suspend fun parseCatalog(html: String): List<Anime> = coroutineScope {
+        val parsed = Jsoup.parse(html).select(".flw-item").mapNotNull { card ->
+            val link = card.selectFirst("a.dynamic-name") ?: return@mapNotNull null
+            val slug = URI(BASE).resolve(link.attr("href")).path.trim('/')
+            val title = link.text().ifBlank { link.attr("title") }
+            if (slug.isBlank() || title.isBlank()) return@mapNotNull null
+            val image = card.selectFirst("img.film-poster-img")
+            val poster = image?.attr("data-src").orEmpty().ifBlank { image?.attr("src").orEmpty() }
+            Anime(slug, title, poster, synopsis = card.selectFirst(".description")?.text().orEmpty().take(500), metadata = card.select(".fdi-item").map { it.text() }.take(4))
+        }.distinctBy { it.slug }.take(36)
+        val semaphore = Semaphore(4)
+        parsed.map { anime ->
+            async { semaphore.withPermit { anime.copy(synopsis = translatePtBr(anime.synopsis)) } }
+        }.awaitAll()
+    }
 
     private fun translatePtBr(text: String): String {
         if (text.isBlank() || text.length > 500) return text
@@ -404,6 +442,27 @@ class AnimeRepository {
         private const val MIN_SUBTITLE_DURATION_RATIO = 0.60
         private const val MAX_SUBTITLE_DURATION_RATIO = 1.15
         private const val MAX_SUBTITLE_INSPECTION_CHARACTERS = 2_000_000
+        private val titleSearchAliases = mapOf(
+            "os sete pecados capitais" to listOf("Nanatsu no Taizai", "The Seven Deadly Sins"),
+            "sete pecados capitais" to listOf("Nanatsu no Taizai", "The Seven Deadly Sins"),
+            "nanatsu no taizai" to listOf("The Seven Deadly Sins"),
+            "the seven deadly sins" to listOf("Nanatsu no Taizai"),
+            "demon slayer" to listOf("Kimetsu no Yaiba"),
+            "matador de demonios" to listOf("Kimetsu no Yaiba", "Demon Slayer"),
+            "ataque dos titas" to listOf("Shingeki no Kyojin", "Attack on Titan"),
+            "ataque dos titans" to listOf("Shingeki no Kyojin", "Attack on Titan"),
+            "shingeki no kyojin" to listOf("Attack on Titan"),
+            "attack on titan" to listOf("Shingeki no Kyojin"),
+            "caderno da morte" to listOf("Death Note"),
+            "cacador x cacador" to listOf("Hunter x Hunter"),
+            "hunter x hunter" to listOf("Hunter x Hunter"),
+            "academia meu heroi" to listOf("Boku no Hero Academia", "My Hero Academia"),
+            "meu heroi academia" to listOf("Boku no Hero Academia", "My Hero Academia"),
+            "boku no hero academia" to listOf("My Hero Academia"),
+            "a viagem de chihiro" to listOf("Sen to Chihiro no Kamikakushi", "Spirited Away"),
+            "castelo animado" to listOf("Howl no Ugoku Shiro", "Howl's Moving Castle"),
+            "meu vizinho totoro" to listOf("Tonari no Totoro", "My Neighbor Totoro"),
+        )
         private val translationCache = java.util.concurrent.ConcurrentHashMap<String, String>()
     }
 }
