@@ -22,8 +22,8 @@ data class Anime(
     val metadata: List<String> = emptyList(),
 )
 
-data class Episode(val id: String, val number: String, val title: String)
-data class PlaybackSource(val videoUrl: String, val subtitleUrl: String?, val referer: String, val title: String, val episode: String, val audioLabel: String, val subtitleLabel: String)
+data class Episode(val id: String, val number: String, val title: String, val originalTitle: String = title)
+data class PlaybackSource(val videoUrl: String, val subtitleUrl: String?, val referer: String, val title: String, val episode: String, val audioLabel: String, val subtitleLabel: String, val availableVideoHeights: List<Int> = emptyList())
 
 class AnimeRepository {
     suspend fun airing(): List<Anime> = withContext(Dispatchers.IO) { parseCatalog(fetch("$BASE/top-airing")) }
@@ -39,7 +39,8 @@ class AnimeRepository {
         val listed = Jsoup.parseBodyFragment(json.optString("html")).select("a.ep-item[data-number]").mapNotNull { element ->
             val episodeId = element.attr("data-id")
             val number = element.attr("data-number")
-            if (episodeId.isBlank() || number.isBlank()) null else Episode(episodeId, number, element.attr("title").ifBlank { "Episódio $number" })
+            val title = element.attr("title").ifBlank { "Episódio $number" }
+            if (episodeId.isBlank() || number.isBlank()) null else Episode(episodeId, number, title, title)
         }
         val semaphore = Semaphore(4)
         listed.map { episode -> async {
@@ -80,7 +81,7 @@ class AnimeRepository {
         anime.copy(banner = banner, poster = poster.ifBlank { anime.poster }, synopsis = if (synopsis.isBlank()) anime.synopsis else translatePtBr(synopsis))
     }
 
-    suspend fun resolve(anime: Anime, episode: Episode, dubbed: Boolean, quality: String, openSubtitlesEnabled: Boolean, openSubtitlesApiKey: String): PlaybackSource = withContext(Dispatchers.IO) {
+    suspend fun resolve(anime: Anime, episode: Episode, dubbed: Boolean, openSubtitlesEnabled: Boolean, openSubtitlesApiKey: String): PlaybackSource = withContext(Dispatchers.IO) {
         val serverResponse = fetch("$BASE/api/theme/episode/servers?episodeId=${episode.id}")
         val serverHtml = runCatching { org.json.JSONObject(serverResponse).optString("html") }.getOrDefault("").ifBlank { serverResponse }
         val serversDoc = Jsoup.parse(serverHtml)
@@ -107,10 +108,12 @@ class AnimeRepository {
         val json = org.json.JSONObject(deobfuscate(blob))
         val playlistUrl = json.optString("src").takeIf { it.contains(".m3u8") }
             ?: error("A fonte não forneceu uma playlist HLS.")
+        val playlist = fetch(playlistUrl, referer)
+        val sourceFrameRate = Regex("FRAME-RATE=([0-9.]+)").find(playlist)?.groupValues?.get(1)?.toDoubleOrNull()
         val sourceTracks = json.optJSONArray("subtitles")
         val sourcePtBr = choosePtBrSubtitle(sourceTracks)
         val openSubtitle = if (sourcePtBr == null && openSubtitlesEnabled && openSubtitlesApiKey.isNotBlank()) {
-            runCatching { findOpenSubtitlesPtBr(anime, episode, openSubtitlesApiKey) }.getOrNull()
+            runCatching { findOpenSubtitlesPtBr(anime, episode, openSubtitlesApiKey, sourceFrameRate) }.getOrNull()
         } else null
         val sourceEnglish = if (sourcePtBr == null && openSubtitle == null) chooseEnglishSubtitle(sourceTracks) else null
         val subtitle = sourcePtBr ?: openSubtitle?.url ?: sourceEnglish
@@ -122,19 +125,13 @@ class AnimeRepository {
             openSubtitlesApiKey.isBlank() -> "Sem PT-BR · configure OpenSubtitles"
             else -> "Sem legenda disponível"
         }
-        val playlist = fetch(playlistUrl, referer)
-        val variants = Regex("(?m)^#EXT-X-STREAM-INF:.*?(?:RESOLUTION=\\d+x)?(\\d{3,4})?.*\\n([^#\\n][^\\n]*)")
-            .findAll(playlist).mapNotNull { match ->
-                val line = match.groupValues[2].trim()
-                val height = match.groupValues[1].toIntOrNull() ?: Regex("RESOLUTION=\\d+x(\\d+)").find(match.value)?.groupValues?.get(1)?.toIntOrNull() ?: 0
-                if (line.isBlank()) null else height to URI(playlistUrl).resolve(line).toString()
-            }.toList()
-        val selected = when (quality) {
-            "best" -> variants.maxByOrNull { it.first }
-            "worst" -> variants.minByOrNull { it.first }
-            else -> variants.minByOrNull { kotlin.math.abs(it.first - quality.removeSuffix("p").toInt()) }
-        } ?: (0 to playlistUrl)
-        PlaybackSource(selected.second, subtitle, referer, anime.title, episode.number, audioLabel, subtitleLabel)
+        val availableHeights = Regex("(?m)^#EXT-X-STREAM-INF:([^\\n]*)")
+            .findAll(playlist)
+            .mapNotNull { Regex("RESOLUTION=\\d+x(\\d+)").find(it.groupValues[1])?.groupValues?.get(1)?.toIntOrNull() }
+            .distinct()
+            .sortedDescending()
+            .toList()
+        PlaybackSource(playlistUrl, subtitle, referer, anime.title, episode.number, audioLabel, subtitleLabel, availableHeights)
     }
 
     private fun choosePtBrSubtitle(tracks: org.json.JSONArray?): String? {
@@ -154,30 +151,83 @@ class AnimeRepository {
             ?: entries.firstOrNull { it.optBoolean("default") }?.optString("src")?.takeIf { it.isNotBlank() }
     }
 
-    private data class ExternalSubtitle(val url: String)
+    private data class ExternalSubtitle(val url: String, val durationSeconds: Double? = null)
+    private data class OpenSubtitleCandidate(
+        val fileId: Int,
+        val titleScore: Double,
+        val seriesScore: Double,
+        val frameRateDifference: Double,
+        val downloadCount: Int,
+    )
     private class OpenSubtitlesApiException(val statusCode: Int) : Exception("OpenSubtitles HTTP $statusCode")
 
-    private fun findOpenSubtitlesPtBr(anime: Anime, episode: Episode, apiKey: String): ExternalSubtitle? =
-        runCatching { findOpenSubtitlesPtBrOnce(anime, episode, apiKey) }.getOrNull()
+    private fun findOpenSubtitlesPtBr(anime: Anime, episode: Episode, apiKey: String, sourceFrameRate: Double?): ExternalSubtitle? =
+        runCatching { findOpenSubtitlesPtBrOnce(anime, episode, apiKey, sourceFrameRate) }.getOrNull()
 
-    private fun findOpenSubtitlesPtBrOnce(anime: Anime, episode: Episode, apiKey: String): ExternalSubtitle? {
+    private fun findOpenSubtitlesPtBrOnce(anime: Anime, episode: Episode, apiKey: String, sourceFrameRate: Double?): ExternalSubtitle? {
         val episodeNumber = episode.number.toDoubleOrNull()?.toInt() ?: return null
         val cleanTitle = anime.title.replace(Regex("(?i)\\b(?:season\\s*\\d+|\\d+(?:st|nd|rd|th)\\s+season|part\\s*\\d+)\\b"), " ").trim()
         val query = URLEncoder.encode(cleanTitle, Charsets.UTF_8.name())
-        val season = Regex("(?i)(?:season\\s*(\\d+)|(\\d+)(?:st|nd|rd|th)\\s+season)")
+        val season = Regex("(?i)(?:season\\s*(\\d+)|(\\d+)(?:st|nd|rd|th)\\s+season|\\bs\\s*(\\d+)\\b)")
             .find(anime.title)?.groupValues?.drop(1)?.firstOrNull { it.isNotBlank() }?.toIntOrNull()
         val seasonParam = season?.let { "&season_number=$it" }.orEmpty()
         val searchUrl = "$OPEN_SUBTITLES_BASE/subtitles?episode_number=$episodeNumber&languages=pt-br&order_by=download_count&order_direction=desc&query=$query&type=episode$seasonParam"
         val search = openSubtitlesRequest(searchUrl, apiKey)
         val rows = search.optJSONArray("data") ?: return null
-        val candidate = (0 until rows.length()).mapNotNull { rows.optJSONObject(it) }
-            .filter { row -> row.optJSONObject("attributes")?.optString("language")?.equals("pt-br", true) == true }
-            .sortedByDescending { it.optJSONObject("attributes")?.optInt("download_count", 0) ?: 0 }
-            .firstOrNull() ?: return null
-        val files = candidate.optJSONObject("attributes")?.optJSONArray("files") ?: return null
-        val fileId = (0 until files.length()).mapNotNull { files.optJSONObject(it) }
-            .firstOrNull()?.optInt("file_id", 0)?.takeIf { it > 0 } ?: return null
-        return requestSubtitleDownload(fileId, apiKey)
+        val episodeTitle = usefulEpisodeTitle(episode.originalTitle)
+        val candidates = (0 until rows.length()).mapNotNull { index ->
+            val attributes = rows.optJSONObject(index)?.optJSONObject("attributes") ?: return@mapNotNull null
+            if (!attributes.optString("language").equals("pt-br", true)) return@mapNotNull null
+            val details = attributes.optJSONObject("feature_details")
+            val featureType = details?.optString("feature_type").orEmpty()
+            if (featureType.isNotBlank() && !featureType.equals("episode", true)) return@mapNotNull null
+
+            val release = attributes.optString("release")
+            val fileArray = attributes.optJSONArray("files") ?: return@mapNotNull null
+            val fileId = (0 until fileArray.length()).mapNotNull { fileArray.optJSONObject(it) }
+                .firstOrNull()?.optInt("file_id", 0)?.takeIf { it > 0 } ?: return@mapNotNull null
+            val fileName = (0 until fileArray.length()).mapNotNull { fileArray.optJSONObject(it) }
+                .firstOrNull()?.optString("file_name").orEmpty()
+            val releaseEpisode = parseSeasonEpisode("$release $fileName")
+            val resultEpisode = details?.optInt("episode_number", 0)?.takeIf { it > 0 } ?: releaseEpisode?.second
+            if (resultEpisode != null && resultEpisode != episodeNumber) return@mapNotNull null
+            val resultSeason = details?.optInt("season_number", 0)?.takeIf { it > 0 } ?: releaseEpisode?.first
+            if (season != null && resultSeason != null && resultSeason != season) return@mapNotNull null
+
+            val seriesTitles = listOf(
+                details?.optString("parent_title").orEmpty(),
+                details?.optString("movie_name").orEmpty().replace(Regex("(?i)\\s*[-:]?\\s*S\\d{1,2}E\\d{1,3}.*$"), ""),
+                release,
+                fileName,
+            ).filter { it.isNotBlank() }
+            val seriesScore = seriesTitles.maxOfOrNull { titleSimilarity(anime.title, it) } ?: 0.0
+            if (seriesScore < MIN_SERIES_TITLE_MATCH) return@mapNotNull null
+
+            val candidateEpisodeTitle = details?.optString("title").orEmpty()
+            val titleScore = if (episodeTitle.isBlank()) 0.0 else episodeTitleSimilarity(episodeTitle, candidateEpisodeTitle)
+            val subtitleFps = attributes.optDouble("fps", 0.0).takeIf { it > 0.0 }
+            val frameRateDifference = if (sourceFrameRate != null && subtitleFps != null) kotlin.math.abs(sourceFrameRate - subtitleFps) else Double.MAX_VALUE
+            OpenSubtitleCandidate(
+                fileId = fileId,
+                titleScore = titleScore,
+                seriesScore = seriesScore,
+                frameRateDifference = frameRateDifference,
+                downloadCount = attributes.optInt("download_count", 0),
+            )
+        }.sortedWith(
+            compareByDescending<OpenSubtitleCandidate> { it.titleScore }
+                .thenByDescending { it.seriesScore }
+                .thenBy { it.frameRateDifference }
+                .thenByDescending { it.downloadCount },
+        )
+        val candidate = candidates.firstOrNull() ?: return null
+        val subtitle = requestSubtitleDownload(candidate.fileId, apiKey) ?: return null
+        val expectedDuration = anime.metadata.mapNotNull(::runtimeSeconds).firstOrNull()
+        val subtitleDuration = subtitle.durationSeconds
+        if (expectedDuration != null && subtitleDuration != null &&
+            subtitleDuration !in expectedDuration * MIN_SUBTITLE_DURATION_RATIO..expectedDuration * MAX_SUBTITLE_DURATION_RATIO
+        ) return null
+        return subtitle
     }
 
     private fun requestSubtitleDownload(fileId: Int, apiKey: String): ExternalSubtitle? {
@@ -195,9 +245,86 @@ class AnimeRepository {
             val code = request.responseCode
             val body = (if (code in 200..299) request.inputStream else request.errorStream)?.bufferedReader(Charsets.UTF_8)?.use { it.readText() }.orEmpty()
             if (code !in 200..299) throw OpenSubtitlesApiException(code)
-            org.json.JSONObject(body).optString("link").takeIf { it.startsWith("https://") }?.let(::ExternalSubtitle)
+            val link = org.json.JSONObject(body).optString("link").takeIf { it.startsWith("https://") } ?: return null
+            ExternalSubtitle(link, fetchSubtitleDuration(link))
         } finally {
             request.disconnect()
+        }
+    }
+
+    private fun fetchSubtitleDuration(url: String): Double? {
+        val request = runCatching { URL(url).openConnection() as HttpURLConnection }.getOrNull() ?: return null
+        request.connectTimeout = 10_000
+        request.readTimeout = 12_000
+        request.setRequestProperty("Accept", "text/plain, */*")
+        request.setRequestProperty("User-Agent", OPEN_SUBTITLES_USER_AGENT)
+        val cuePattern = Regex("(\\d{2}:\\d{2}:\\d{2}[,.]\\d{3})\\s*-->\\s*(\\d{2}:\\d{2}:\\d{2}[,.]\\d{3})")
+        return try {
+            var consumedCharacters = 0
+            var lastEnd: Double? = null
+            request.inputStream.bufferedReader(Charsets.UTF_8).useLines { lines ->
+                lines.forEach { line ->
+                    consumedCharacters += line.length
+                    if (consumedCharacters > MAX_SUBTITLE_INSPECTION_CHARACTERS) return@useLines
+                    val times = cuePattern.find(line)?.groupValues ?: return@forEach
+                    lastEnd = timestampSeconds(times[2])
+                }
+            }
+            lastEnd
+        } catch (_: Exception) {
+            null
+        } finally {
+            request.disconnect()
+        }
+    }
+
+    private fun timestampSeconds(value: String): Double? {
+        val pieces = value.replace(',', '.').split(':')
+        if (pieces.size != 3) return null
+        val seconds = pieces[2].toDoubleOrNull() ?: return null
+        return pieces[0].toIntOrNull()?.times(3600)?.plus(pieces[1].toIntOrNull()?.times(60) ?: return null)?.plus(seconds)
+    }
+
+    private fun runtimeSeconds(value: String): Double? {
+        val match = Regex("(?i)\\b(\\d{1,3})\\s*(?:m|min|mins|minutes?)\\b").find(value) ?: return null
+        return match.groupValues[1].toDoubleOrNull()?.times(60)
+    }
+
+    private fun usefulEpisodeTitle(value: String): String {
+        val normalized = normalizeMatchText(value).replace(Regex("^(?:episode|ep|episodio)\\s*\\d+\\s*"), "").trim()
+        return normalized.takeUnless { it.isBlank() || it.matches(Regex("\\d+")) }.orEmpty()
+    }
+
+    private fun titleSimilarity(first: String, second: String): Double {
+        val firstTokens = normalizeMatchText(first).split(' ').filter { it.length > 1 }.toSet()
+        val secondTokens = normalizeMatchText(second).split(' ').filter { it.length > 1 }.toSet()
+        if (firstTokens.isEmpty() || secondTokens.isEmpty()) return 0.0
+        val common = firstTokens.intersect(secondTokens).size.toDouble()
+        return common / minOf(firstTokens.size, secondTokens.size)
+    }
+
+    private fun episodeTitleSimilarity(first: String, second: String): Double {
+        val firstTokens = normalizeMatchText(first).split(' ').filter { it.length > 1 }.toSet()
+        val secondTokens = normalizeMatchText(second).split(' ').filter { it.length > 1 }.toSet()
+        if (firstTokens.isEmpty() || secondTokens.isEmpty()) return 0.0
+        return firstTokens.intersect(secondTokens).size.toDouble() / maxOf(firstTokens.size, secondTokens.size)
+    }
+
+    private fun normalizeMatchText(value: String): String {
+        val withoutMarks = java.text.Normalizer.normalize(value, java.text.Normalizer.Form.NFD)
+            .replace(Regex("\\p{Mn}+"), "")
+        return withoutMarks.lowercase()
+            .replace(Regex("(?i)\\b(?:s\\d{1,2}e\\d{1,3}|\\d{1,2}x\\d{1,3})\\b"), " ")
+            .replace(Regex("[^a-z0-9]+"), " ")
+            .trim()
+    }
+
+    private fun parseSeasonEpisode(value: String): Pair<Int, Int>? {
+        val seasonEpisode = Regex("(?i)\\bS(\\d{1,2})E(\\d{1,3})\\b").find(value)
+            ?: Regex("(?i)\\b(\\d{1,2})x(\\d{1,3})\\b").find(value)
+            ?: return null
+        return seasonEpisode.groupValues[1].toIntOrNull()?.let { season ->
+            seasonEpisode.groupValues[2].toIntOrNull()?.let { episode -> season to episode }
         }
     }
 
@@ -273,6 +400,10 @@ class AnimeRepository {
         private const val OPEN_SUBTITLES_BASE = "https://api.opensubtitles.com/api/v1"
         private const val USER_AGENT = "Mozilla/5.0 (Linux; Android 14; Pixel 8) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.0.0 Mobile Safari/537.36"
         private const val OPEN_SUBTITLES_USER_AGENT = "ani-cli-pt v0.1.3"
+        private const val MIN_SERIES_TITLE_MATCH = 0.5
+        private const val MIN_SUBTITLE_DURATION_RATIO = 0.60
+        private const val MAX_SUBTITLE_DURATION_RATIO = 1.15
+        private const val MAX_SUBTITLE_INSPECTION_CHARACTERS = 2_000_000
         private val translationCache = java.util.concurrent.ConcurrentHashMap<String, String>()
     }
 }

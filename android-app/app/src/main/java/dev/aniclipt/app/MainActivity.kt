@@ -60,6 +60,7 @@ import androidx.media3.common.PlaybackException
 import androidx.media3.datasource.DefaultHttpDataSource
 import androidx.media3.datasource.HttpDataSource.InvalidResponseCodeException
 import androidx.media3.exoplayer.ExoPlayer
+import androidx.media3.exoplayer.trackselection.DefaultTrackSelector
 import androidx.media3.ui.PlayerView
 import androidx.media3.ui.CaptionStyleCompat
 import coil.compose.AsyncImage
@@ -391,7 +392,7 @@ private fun AnimeHome() {
         busy = true
         error = null
         scope.launch {
-            runCatching { repository.resolve(anime, episode, dubbed, quality, openSubtitlesEnabled, openSubtitlesApiKey.trim()) }
+            runCatching { repository.resolve(anime, episode, dubbed, openSubtitlesEnabled, openSubtitlesApiKey.trim()) }
                 .onSuccess {
                     source = it
                     chosenEpisode = episode
@@ -473,8 +474,6 @@ private fun AnimeHome() {
             if (settingsView) {
                 SettingsScreen(
                     modifier = Modifier.weight(1f).widthIn(max = 760.dp).align(Alignment.CenterHorizontally),
-                    quality = quality,
-                    onQuality = { quality = it; prefs.edit().putString("quality", it).apply() },
                     dubbed = dubbed,
                     onDubbed = { dubbed = it; prefs.edit().putBoolean("default_dubbed", it).apply() },
                     notificationsEnabled = notificationsEnabled,
@@ -537,10 +536,10 @@ private fun AnimeHome() {
 
     if (selected != null && source == null) {
         val episodeAnime = currentSeason ?: selected!!
-        EpisodeSheet(anime = episodeAnime, episodes = episodes, watched = history.split(',').filter { it.isNotBlank() }.toSet(), busy = busy, error = error, dubbed = dubbed, onDubbed = { dubbed = it; prefs.edit().putBoolean("default_dubbed", it).apply() }, quality = quality, onQuality = { quality = it; prefs.edit().putString("quality", it).apply() }, favorites = favorites, favoriteSlug = selected!!.slug, onFavorite = { toggleFavorite(selected!!) }, seasons = seasonOptions, onSeasonSelected = ::openSeason, onClose = { selected = null; currentSeason = null; seasonOptions = emptyList(); error = null }, onPlay = { episode -> play(episodeAnime, episode) })
+        EpisodeSheet(anime = episodeAnime, episodes = episodes, watched = history.split(',').filter { it.isNotBlank() }.toSet(), busy = busy, error = error, dubbed = dubbed, onDubbed = { dubbed = it; prefs.edit().putBoolean("default_dubbed", it).apply() }, favorites = favorites, favoriteSlug = selected!!.slug, onFavorite = { toggleFavorite(selected!!) }, seasons = seasonOptions, onSeasonSelected = ::openSeason, onClose = { selected = null; currentSeason = null; seasonOptions = emptyList(); error = null }, onPlay = { episode -> play(episodeAnime, episode) })
     }
     if (source != null) {
-        NativePlayer(source = source!!, onClose = { source = null }, subtitleSize = subtitleSize, subtitleColor = subtitleColor, subtitleFont = subtitleFont, subtitleBackground = subtitleBackground, modifier = Modifier.fillMaxSize())
+        NativePlayer(source = source!!, quality = quality, onQuality = { quality = it; prefs.edit().putString("quality", it).apply() }, onClose = { source = null }, subtitleSize = subtitleSize, subtitleColor = subtitleColor, subtitleFont = subtitleFont, subtitleBackground = subtitleBackground, modifier = Modifier.fillMaxSize())
     }
     }
 }
@@ -595,8 +594,6 @@ private fun Tag(text: String) {
 @Composable
 private fun SettingsScreen(
     modifier: Modifier = Modifier,
-    quality: String,
-    onQuality: (String) -> Unit,
     dubbed: Boolean,
     onDubbed: (Boolean) -> Unit,
     notificationsEnabled: Boolean,
@@ -621,21 +618,11 @@ private fun SettingsScreen(
     openSubtitlesEnabled: Boolean,
     onOpenSubtitlesEnabled: (Boolean) -> Unit,
 ) {
-    val qualityOptions = listOf("best" to "Automática (melhor disponível)", "1080p" to "1080p", "720p" to "720p", "480p" to "480p", "360p" to "360p")
-    var qualityExpanded by remember { mutableStateOf(false) }
     Column(modifier.fillMaxWidth().verticalScroll(rememberScrollState()).padding(horizontal = 18.dp, vertical = 12.dp)) {
         Text("PREFERÊNCIAS", color = Muted, fontSize = 10.sp, fontWeight = FontWeight.Bold, letterSpacing = 1.5.sp)
         Text("Configurações", fontSize = 28.sp, fontWeight = FontWeight.Bold, modifier = Modifier.padding(bottom = 18.dp))
         Text("REPRODUÇÃO", color = Muted, fontSize = 10.sp, fontWeight = FontWeight.Bold, letterSpacing = 1.3.sp, modifier = Modifier.padding(start = 4.dp, bottom = 8.dp))
         Column(Modifier.fillMaxWidth().clip(RoundedCornerShape(18.dp)).background(Color(0xB8202024)).border(1.dp, Color.White.copy(.08f), RoundedCornerShape(18.dp)).padding(horizontal = 16.dp)) {
-            Row(Modifier.fillMaxWidth().clickable { qualityExpanded = true }.padding(vertical = 15.dp), verticalAlignment = Alignment.CenterVertically) {
-                Column(Modifier.weight(1f)) { Text("Qualidade padrão", fontWeight = FontWeight.SemiBold, fontSize = 14.sp); Text("Aplicada ao selecionar um episódio", color = Muted, fontSize = 11.sp, modifier = Modifier.padding(top = 3.dp)) }
-                Text(qualityOptions.firstOrNull { it.first == quality }?.second?.substringBefore(" (") ?: quality, color = Color(0xFFB9D9FF), fontSize = 12.sp)
-                DropdownMenu(expanded = qualityExpanded, onDismissRequest = { qualityExpanded = false }) {
-                    qualityOptions.forEach { (value, label) -> DropdownMenuItem(text = { Text(label) }, onClick = { onQuality(value); qualityExpanded = false }) }
-                }
-            }
-            HorizontalDivider(color = Color.White.copy(.08f))
             Row(Modifier.fillMaxWidth().padding(vertical = 12.dp), verticalAlignment = Alignment.CenterVertically) {
                 Column(Modifier.weight(1f).padding(end = 10.dp)) { Text("Preferir dublagem PT-BR", fontWeight = FontWeight.SemiBold, fontSize = 14.sp); Text("Sem faixa PT-BR identificada: usa áudio original", color = Muted, fontSize = 11.sp, modifier = Modifier.padding(top = 3.dp)) }
                 Switch(checked = dubbed, onCheckedChange = onDubbed)
@@ -751,9 +738,8 @@ private fun seasonLabel(anime: Anime, seasons: List<Anime>): String {
 
 @OptIn(ExperimentalMaterial3Api::class)
 @Composable
-private fun EpisodeSheet(anime: Anime, episodes: List<Episode>, watched: Set<String>, busy: Boolean, error: String?, dubbed: Boolean, onDubbed: (Boolean) -> Unit, quality: String, onQuality: (String) -> Unit, favorites: Set<String>, favoriteSlug: String, onFavorite: () -> Unit, seasons: List<Anime>, onSeasonSelected: (Anime) -> Unit, onClose: () -> Unit, onPlay: (Episode) -> Unit) {
+private fun EpisodeSheet(anime: Anime, episodes: List<Episode>, watched: Set<String>, busy: Boolean, error: String?, dubbed: Boolean, onDubbed: (Boolean) -> Unit, favorites: Set<String>, favoriteSlug: String, onFavorite: () -> Unit, seasons: List<Anime>, onSeasonSelected: (Anime) -> Unit, onClose: () -> Unit, onPlay: (Episode) -> Unit) {
     var picked by remember(anime.slug) { mutableStateOf<Episode?>(null) }
-    var qualityExpanded by remember { mutableStateOf(false) }
     var seasonExpanded by remember { mutableStateOf(false) }
     val sheetState = rememberModalBottomSheetState(skipPartiallyExpanded = true)
     val configuration = LocalConfiguration.current
@@ -796,28 +782,15 @@ private fun EpisodeSheet(anime: Anime, episodes: List<Episode>, watched: Set<Str
             BoxWithConstraints(Modifier.fillMaxWidth().padding(top = 10.dp)) {
                 val narrow = maxWidth < 380.dp
                 if (narrow) {
-                    Column {
-                        Row(verticalAlignment = Alignment.CenterVertically) {
-                            FilterChip(selected = !dubbed, onClick = { onDubbed(false) }, label = { Text(if (compact) "Original" else "Original · legendado", maxLines = 1) })
-                            Spacer(Modifier.width(6.dp))
-                            FilterChip(selected = dubbed, onClick = { onDubbed(true) }, label = { Text(if (compact) "PT-BR" else "Dublado PT-BR") })
-                        }
-                        Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.End) {
-                            Box {
-                                TextButton(onClick = { qualityExpanded = true }) { Text("${qualityLabel(quality)} ▾", fontSize = 10.sp) }
-                                DropdownMenu(expanded = qualityExpanded, onDismissRequest = { qualityExpanded = false }) { listOf("best" to "Automática", "1080p" to "1080p", "720p" to "720p", "480p" to "480p", "360p" to "360p").forEach { (value, label) -> DropdownMenuItem(text = { Text(label) }, onClick = { onQuality(value); qualityExpanded = false }) } }
-                            }
-                        }
+                    Row(verticalAlignment = Alignment.CenterVertically) {
+                        FilterChip(selected = !dubbed, onClick = { onDubbed(false) }, label = { Text(if (compact) "Original" else "Original · legendado", maxLines = 1) })
+                        Spacer(Modifier.width(6.dp))
+                        FilterChip(selected = dubbed, onClick = { onDubbed(true) }, label = { Text(if (compact) "PT-BR" else "Dublado PT-BR") })
                     }
                 } else Row(verticalAlignment = Alignment.CenterVertically) {
                     FilterChip(selected = !dubbed, onClick = { onDubbed(false) }, label = { Text("Original · legendado", maxLines = 1) })
                     Spacer(Modifier.width(8.dp))
                     FilterChip(selected = dubbed, onClick = { onDubbed(true) }, label = { Text("Dublado PT-BR") })
-                    Spacer(Modifier.weight(1f))
-                    Box {
-                        TextButton(onClick = { qualityExpanded = true }) { Text("${qualityLabel(quality)} ▾", fontSize = 10.sp) }
-                        DropdownMenu(expanded = qualityExpanded, onDismissRequest = { qualityExpanded = false }) { listOf("best" to "Automática", "1080p" to "1080p", "720p" to "720p", "480p" to "480p", "360p" to "360p").forEach { (value, label) -> DropdownMenuItem(text = { Text(label) }, onClick = { onQuality(value); qualityExpanded = false }) } }
-                    }
                 }
             }
             if (busy) LinearProgressIndicator(Modifier.fillMaxWidth(), color = Accent)
@@ -845,7 +818,7 @@ private fun EpisodeSheet(anime: Anime, episodes: List<Episode>, watched: Set<Str
 }
 
 @Composable
-private fun NativePlayer(source: PlaybackSource, onClose: () -> Unit, subtitleSize: String, subtitleColor: String, subtitleFont: String, subtitleBackground: String, modifier: Modifier = Modifier) {
+private fun NativePlayer(source: PlaybackSource, quality: String, onQuality: (String) -> Unit, onClose: () -> Unit, subtitleSize: String, subtitleColor: String, subtitleFont: String, subtitleBackground: String, modifier: Modifier = Modifier) {
     val context = LocalContext.current
     val activity = context as? Activity
     val configuration = LocalConfiguration.current
@@ -853,6 +826,9 @@ private fun NativePlayer(source: PlaybackSource, onClose: () -> Unit, subtitleSi
     val previousOrientation = remember(source.videoUrl) { activity?.requestedOrientation ?: ActivityInfo.SCREEN_ORIENTATION_UNSPECIFIED }
     val lifecycleOwner = LocalLifecycleOwner.current
     val playbackError = remember(source.videoUrl) { mutableStateOf<String?>(null) }
+    val trackSelector = remember(source.videoUrl) { DefaultTrackSelector(context) }
+    var qualityMenuExpanded by remember(source.videoUrl) { mutableStateOf(false) }
+    val selectedHeight = quality.removeSuffix("p").toIntOrNull()?.takeIf { it in source.availableVideoHeights }
     val player = remember(source.videoUrl) {
         val origin = runCatching { android.net.Uri.parse(source.referer).let { "${it.scheme}://${it.host}" } }.getOrDefault(source.referer)
         val headers = mapOf(
@@ -872,7 +848,10 @@ private fun NativePlayer(source: PlaybackSource, onClose: () -> Unit, subtitleSi
                 setSubtitleConfigurations(listOf(MediaItem.SubtitleConfiguration.Builder(android.net.Uri.parse(subtitle)).setMimeType(mime).setLanguage(language).setLabel(source.subtitleLabel).setSelectionFlags(C.SELECTION_FLAG_DEFAULT).build()))
             }
         }.build()
-        ExoPlayer.Builder(context).setMediaSourceFactory(androidx.media3.exoplayer.source.DefaultMediaSourceFactory(dataSource)).build().apply {
+        ExoPlayer.Builder(context)
+            .setTrackSelector(trackSelector)
+            .setMediaSourceFactory(androidx.media3.exoplayer.source.DefaultMediaSourceFactory(dataSource))
+            .build().apply {
             addListener(object : androidx.media3.common.Player.Listener {
                 override fun onPlayerError(error: PlaybackException) {
                     val causeChain = generateSequence(error as Throwable?) { it.cause }.toList()
@@ -898,11 +877,29 @@ private fun NativePlayer(source: PlaybackSource, onClose: () -> Unit, subtitleSi
             activity?.requestedOrientation = previousOrientation
         }
     }
+    LaunchedEffect(trackSelector, quality, source.availableVideoHeights) {
+        if (quality != "best" && selectedHeight == null) onQuality("best")
+        val parameters = trackSelector.buildUponParameters().clearVideoSizeConstraints()
+        if (selectedHeight != null) {
+            parameters.setMinVideoSize(1, selectedHeight).setMaxVideoSize(Int.MAX_VALUE, selectedHeight)
+        }
+        trackSelector.setParameters(parameters)
+    }
     Column(modifier.background(Color.Black).statusBarsPadding()) {
         Row(Modifier.fillMaxWidth().background(Color(0xFF171719)).padding(horizontal = 12.dp, vertical = if (isLandscape) 2.dp else 10.dp), verticalAlignment = Alignment.CenterVertically) {
             IconButton(onClick = onClose) { Icon(Icons.Default.ArrowBack, "Voltar", tint = Ink) }
-            Column(Modifier.padding(start = 4.dp)) { Text(source.title, color = Ink, fontWeight = FontWeight.SemiBold, maxLines = 1); Text("Episódio ${source.episode} · ${source.audioLabel} · ${source.subtitleLabel}", color = Muted, fontSize = 10.sp, maxLines = 1) }
-            Spacer(Modifier.weight(1f))
+            Column(Modifier.weight(1f).padding(start = 4.dp)) { Text(source.title, color = Ink, fontWeight = FontWeight.SemiBold, maxLines = 1); Text("Episódio ${source.episode} · ${source.audioLabel} · ${source.subtitleLabel}", color = Muted, fontSize = 10.sp, maxLines = 1) }
+            Box {
+                TextButton(onClick = { qualityMenuExpanded = true }, contentPadding = PaddingValues(horizontal = 4.dp)) {
+                    Text("${qualityLabel(quality)} ▾", color = Color(0xFFB9D9FF), fontSize = 11.sp, maxLines = 1)
+                }
+                DropdownMenu(expanded = qualityMenuExpanded, onDismissRequest = { qualityMenuExpanded = false }) {
+                    DropdownMenuItem(text = { Text("Automática") }, onClick = { onQuality("best"); qualityMenuExpanded = false })
+                    source.availableVideoHeights.forEach { height ->
+                        DropdownMenuItem(text = { Text("${height}p") }, onClick = { onQuality("${height}p"); qualityMenuExpanded = false })
+                    }
+                }
+            }
             IconButton(onClick = { activity?.requestedOrientation = if (isLandscape) ActivityInfo.SCREEN_ORIENTATION_PORTRAIT else ActivityInfo.SCREEN_ORIENTATION_LANDSCAPE }) {
                 Icon(Icons.Default.ScreenRotation, if (isLandscape) "Voltar para modo retrato" else "Girar para modo paisagem", tint = Ink)
             }
