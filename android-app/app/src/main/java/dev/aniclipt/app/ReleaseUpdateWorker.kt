@@ -21,13 +21,17 @@ import androidx.work.WorkManager
 import androidx.work.WorkerParameters
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.withContext
+import kotlinx.coroutines.CancellationException
 import org.json.JSONObject
 import java.io.File
 import java.io.FileOutputStream
+import java.io.IOException
 import java.security.MessageDigest
 import java.net.HttpURLConnection
 import java.net.URL
 import java.util.concurrent.TimeUnit
+
+private class UpdateFailure(val status: String, message: String) : Exception(message)
 
 class ReleaseUpdateWorker(context: Context, params: WorkerParameters) : CoroutineWorker(context, params) {
     override suspend fun doWork(): Result = withContext(Dispatchers.IO) {
@@ -48,23 +52,30 @@ class ReleaseUpdateWorker(context: Context, params: WorkerParameters) : Coroutin
             connection.readTimeout = 12_000
             connection.setRequestProperty("Accept", "application/vnd.github+json")
             connection.setRequestProperty("User-Agent", "ani-cli-pt-android")
-            val release = connection.inputStream.bufferedReader().use { JSONObject(it.readText()) }
-            connection.disconnect()
+            val release = try {
+                val response = connection.responseCode
+                if (response !in 200..299) {
+                    val status = if (response == 403 || response == 429) STATUS_FAILED_RATE_LIMIT else STATUS_FAILED_SERVER
+                    throw UpdateFailure(status, "GitHub respondeu com HTTP $response")
+                }
+                connection.inputStream.bufferedReader().use { JSONObject(it.readText()) }
+            } finally { connection.disconnect() }
 
             val latestTag = release.optString("tag_name").removePrefix("v").ifBlank { error("O GitHub não informou uma versão de release.") }
             @Suppress("DEPRECATION")
             val installedInfo = applicationContext.packageManager.getPackageInfo(applicationContext.packageName, 0)
             val installedVersion = installedInfo.versionName.orEmpty()
-            if (compareVersions(latestTag, installedVersion) > 0) {
+            if (compareReleaseVersions(latestTag, installedVersion) > 0) {
                 prefs.edit().putString(PREF_AVAILABLE_VERSION, latestTag).apply()
                 if (!shouldDownload) return@runCatching
                 if (manualDownload) prefs.edit().putString(PREF_DOWNLOAD_STATUS, STATUS_DOWNLOADING).apply()
-                val assets = release.optJSONArray("assets") ?: error("A release não contém arquivos para download.")
+                val assets = release.optJSONArray("assets") ?: throw UpdateFailure(STATUS_FAILED_ASSET, "A release não contém arquivos para download.")
                 val apk = (0 until assets.length()).mapNotNull { assets.optJSONObject(it) }
                     .firstOrNull { it.optString("name") == APK_ASSET_NAME }
-                    ?: error("O APK $APK_ASSET_NAME não está disponível nesta release.")
+                    ?: throw UpdateFailure(STATUS_FAILED_ASSET, "O APK esperado não está disponível nesta release.")
                 val downloadUrl = apk.optString("browser_download_url")
-                require(URL(downloadUrl).protocol == "https" && URL(downloadUrl).host == "github.com") { "Endereço do APK inválido." }
+                val parsedUrl = runCatching { URL(downloadUrl) }.getOrNull()
+                if (parsedUrl?.protocol != "https" || parsedUrl.host != "github.com") throw UpdateFailure(STATUS_FAILED_INVALID, "Endereço do APK inválido.")
                 val expectedDigest = apk.optString("digest").removePrefix("sha256:").takeIf { it.matches(Regex("[a-fA-F0-9]{64}")) }
                 val updateFile = File(applicationContext.filesDir, "updates/ani-cli-pt-$latestTag.apk")
                 val alreadyDownloaded = updateFile.isFile && expectedDigest != null && sha256(updateFile) == expectedDigest
@@ -82,15 +93,22 @@ class ReleaseUpdateWorker(context: Context, params: WorkerParameters) : Coroutin
             }
         }.fold(
             onSuccess = { Result.success() },
-            onFailure = {
-                if (manualDownload) prefs.edit().putString(PREF_DOWNLOAD_STATUS, STATUS_FAILED).apply()
-                Result.retry()
+            onFailure = { failure ->
+                if (failure is CancellationException) throw failure
+                val status = when (failure) {
+                    is UpdateFailure -> failure.status
+                    is IOException -> STATUS_FAILED_NETWORK
+                    else -> STATUS_FAILED
+                }
+                if (manualDownload) prefs.edit().putString(PREF_DOWNLOAD_STATUS, status).apply()
+                if (status == STATUS_FAILED_NETWORK || status == STATUS_FAILED_SERVER || status == STATUS_FAILED_RATE_LIMIT) Result.retry() else Result.failure()
             },
         )
     }
 
     private fun downloadApk(url: String, destination: File, expectedDigest: String?) {
-        destination.parentFile?.mkdirs()
+        val parent = destination.parentFile ?: throw UpdateFailure(STATUS_FAILED_STORAGE, "Pasta da atualização indisponível.")
+        if (!parent.isDirectory && !parent.mkdirs()) throw UpdateFailure(STATUS_FAILED_STORAGE, "Não foi possível criar a pasta da atualização.")
         val temporary = File(destination.parentFile, "${destination.name}.part")
         val connection = URL(url).openConnection() as HttpURLConnection
         connection.connectTimeout = 20_000
@@ -98,10 +116,29 @@ class ReleaseUpdateWorker(context: Context, params: WorkerParameters) : Coroutin
         connection.instanceFollowRedirects = true
         connection.setRequestProperty("User-Agent", "ani-cli-pt-android")
         try {
-            connection.inputStream.use { input -> FileOutputStream(temporary).use { output -> input.copyTo(output) } }
-            require(temporary.length() > MIN_APK_SIZE) { "O APK baixado está incompleto." }
-            if (expectedDigest != null) require(sha256(temporary).equals(expectedDigest, ignoreCase = true)) { "A verificação do APK falhou." }
-            check(temporary.renameTo(destination)) { "Não foi possível salvar o APK baixado." }
+            val response = connection.responseCode
+            if (response !in 200..299) {
+                val status = if (response == 403 || response == 429) STATUS_FAILED_RATE_LIMIT else STATUS_FAILED_SERVER
+                throw UpdateFailure(status, "Download respondeu com HTTP $response")
+            }
+            connection.inputStream.use { input ->
+                val output = try { FileOutputStream(temporary) } catch (failure: IOException) {
+                    throw UpdateFailure(STATUS_FAILED_STORAGE, "Não foi possível criar o arquivo da atualização.")
+                }
+                output.use {
+                    val buffer = ByteArray(DEFAULT_BUFFER_SIZE)
+                    while (true) {
+                        val count = input.read(buffer)
+                        if (count < 0) break
+                        try { it.write(buffer, 0, count) } catch (failure: IOException) {
+                            throw UpdateFailure(STATUS_FAILED_STORAGE, "Não foi possível gravar a atualização.")
+                        }
+                    }
+                }
+            }
+            if (temporary.length() <= MIN_APK_SIZE) throw UpdateFailure(STATUS_FAILED_INVALID, "O APK baixado está incompleto.")
+            if (expectedDigest != null && !sha256(temporary).equals(expectedDigest, ignoreCase = true)) throw UpdateFailure(STATUS_FAILED_INVALID, "A verificação do APK falhou.")
+            if (!temporary.renameTo(destination)) throw UpdateFailure(STATUS_FAILED_STORAGE, "Não foi possível salvar o APK baixado.")
         } catch (error: Throwable) {
             temporary.delete()
             throw error
@@ -112,11 +149,16 @@ class ReleaseUpdateWorker(context: Context, params: WorkerParameters) : Coroutin
 
     @Suppress("DEPRECATION")
     private fun validateApk(file: File, installedVersionCode: Long) {
-        require(file.isFile && file.length() > MIN_APK_SIZE) { "O APK da atualização não foi encontrado." }
-        val info = applicationContext.packageManager.getPackageArchiveInfo(file.absolutePath, 0)
-            ?: error("O arquivo baixado não é um APK válido.")
-        require(info.packageName == applicationContext.packageName) { "O APK não pertence a este aplicativo." }
-        require(PackageInfoCompat.getLongVersionCode(info) > installedVersionCode) { "A versão baixada não é mais recente." }
+        if (!file.isFile || file.length() <= MIN_APK_SIZE) throw UpdateFailure(STATUS_FAILED_INVALID, "APK incompleto.")
+        val flags = if (Build.VERSION.SDK_INT >= 28) PackageManager.GET_SIGNING_CERTIFICATES else PackageManager.GET_SIGNATURES
+        val info = applicationContext.packageManager.getPackageArchiveInfo(file.absolutePath, flags)
+            ?: throw UpdateFailure(STATUS_FAILED_INVALID, "APK inválido.")
+        val installed = applicationContext.packageManager.getPackageInfo(applicationContext.packageName, flags)
+        val newSignatures = if (Build.VERSION.SDK_INT >= 28) info.signingInfo?.apkContentsSigners else info.signatures
+        val oldSignatures = if (Build.VERSION.SDK_INT >= 28) installed.signingInfo?.apkContentsSigners else installed.signatures
+        if (!isCompatibleUpdate(applicationContext.packageName, info.packageName, installedVersionCode,
+                PackageInfoCompat.getLongVersionCode(info), oldSignatures?.toSet().orEmpty(), newSignatures?.toSet().orEmpty()))
+            throw UpdateFailure(STATUS_FAILED_INVALID, "O pacote, a versão ou a assinatura da atualização não correspondem ao aplicativo instalado.")
     }
 
     private fun sha256(file: File): String {
@@ -160,16 +202,6 @@ class ReleaseUpdateWorker(context: Context, params: WorkerParameters) : Coroutin
         try { NotificationManagerCompat.from(applicationContext).notify(NOTIFICATION_ID, notification) } catch (_: SecurityException) { }
     }
 
-    private fun compareVersions(first: String, second: String): Int {
-        val a = Regex("\\d+").findAll(first).map { it.value.toIntOrNull() ?: 0 }.toList()
-        val b = Regex("\\d+").findAll(second).map { it.value.toIntOrNull() ?: 0 }.toList()
-        for (index in 0 until maxOf(a.size, b.size)) {
-            val comparison = (a.getOrElse(index) { 0 }).compareTo(b.getOrElse(index) { 0 })
-            if (comparison != 0) return comparison
-        }
-        return 0
-    }
-
     companion object {
         const val PREF_ENABLED = "automatic_release_updates"
         const val PREF_AVAILABLE_VERSION = "available_release_version"
@@ -178,6 +210,12 @@ class ReleaseUpdateWorker(context: Context, params: WorkerParameters) : Coroutin
         const val STATUS_READY = "ready"
         const val STATUS_UP_TO_DATE = "up_to_date"
         const val STATUS_FAILED = "failed"
+        const val STATUS_FAILED_NETWORK = "failed_network"
+        const val STATUS_FAILED_SERVER = "failed_server"
+        const val STATUS_FAILED_RATE_LIMIT = "failed_rate_limit"
+        const val STATUS_FAILED_ASSET = "failed_asset"
+        const val STATUS_FAILED_INVALID = "failed_invalid"
+        const val STATUS_FAILED_STORAGE = "failed_storage"
         private const val INPUT_LAUNCH_CHECK = "check_on_app_launch"
         private const val INPUT_MANUAL_DOWNLOAD = "download_manually"
         private const val LATEST_RELEASE_API = "https://api.github.com/repos/kauessilvas/ani-cli-pt/releases/latest"

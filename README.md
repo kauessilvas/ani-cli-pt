@@ -157,7 +157,7 @@ python3 -m unittest discover -s web/tests -v
 
 ## Aplicativo Android nativo
 
-O repositório também contém o projeto Android em Kotlin em [`android-app/`](./android-app/). Ele é independente da interface web e do servidor local: consulta o catálogo no próprio aparelho, mantém favoritos e histórico no armazenamento local, prioriza legendas PT-BR com fallback para português e inglês e reproduz HLS no player Android. Sinopses e títulos de episódios usam tradução automática via MyMemory quando disponível; o texto público do catálogo é enviado ao serviço para tradução, sujeito à disponibilidade e à cota diária anônima. Nas configurações, personalize tamanho, cor, tipo de letra e fundo das legendas.
+O repositório também contém o projeto Android em Kotlin em [`android-app/`](./android-app/). Ele é independente da interface web e do servidor local: consulta o catálogo no próprio aparelho, mantém favoritos e histórico no armazenamento local, prioriza legendas PT-BR com fallback para português e inglês e reproduz HLS no player Android. Sinopses priorizam texto em português das fontes e do TMDB; quando necessário, sinopses e títulos de episódios podem usar tradução automática via MyMemory. O texto público enviado para tradução está sujeito à disponibilidade e à cota diária anônima do serviço. Algumas sinopses podem permanecer indisponíveis. Nas configurações, personalize tamanho, cor, tipo de letra e fundo das legendas.
 
 Baixe a versão de depuração para Android 8.0 ou mais recente na [página de releases](https://github.com/kauessilvas/ani-cli-pt/releases/latest), que inclui o APK como arquivo para download. Este APK é uma prévia para testes, assinada com a chave de depuração do Android; o Android pode exibir alertas de segurança ao instalar aplicativos distribuídos fora da Play Store.
 
@@ -171,5 +171,13 @@ cd android-app
 ```
 
 O APK será criado em `app/build/outputs/apk/debug/app-debug.apk`. Para publicar uma release compatível com o atualizador integrado, anexe esse APK com o nome `ani-cli-pt.apk`. O aplicativo consulta fontes diretamente no aparelho e tenta encontrar a melhor opção disponível, priorizando legendas em português. A disponibilidade do catálogo, dos episódios e da reprodução depende dos provedores e pode mudar.
+
+Para executar os testes automatizados do Android, use `./android-app/gradlew -p android-app :app:testDebugUnitTest` com o JDK e o Android SDK configurados. Os testes também são executados no GitHub Actions em alterações do projeto Android.
+
+Para preparar uma release, execute `scripts/publish-android-release.sh --check-only` com o Android SDK, JDK 17 e `gh` configurados. O comando executa os testes, monta o APK com o nome esperado pelo atualizador e verifica pacote, versão e assinatura contra a release anterior, sem publicar. Após atualizar a versão, commitar e enviar o código, `scripts/publish-android-release.sh --publish notas.md` cria a release como rascunho com o APK validado e a publica. A mesma chave de assinatura da versão anterior precisa estar disponível localmente.
+
+O aplicativo mantém buscas e detalhes recentemente consultados em cache temporário na memória, com prazo e limite de itens. O cache é recriado ao fechar o processo do app; falhas de rede e sinopses ausentes não são guardadas como resultados permanentes.
+
+Nas configurações, é possível ocultar conteúdo adulto identificado pelos metadados das fontes. A classificação pode estar ausente ou incompleta; a opção não garante a ocultação de todos os títulos +18. Os cartões mostram apenas idiomas e formatos informados pelas fontes. Títulos sem episódios e sem alternativas associadas são removidos quando essa informação é confirmada; uma lista de episódios não garante que todos os vídeos estejam funcionando.
 
 O player oferece controles de reprodução, progresso, velocidade, qualidade e proporção. A aparência de legendas separadas pode ser personalizada nas configurações; legendas gravadas na imagem não podem ser modificadas.

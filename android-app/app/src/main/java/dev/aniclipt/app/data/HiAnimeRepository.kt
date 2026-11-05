@@ -99,7 +99,11 @@ class HiAnimeRepository {
         val banner = Regex("url\\(['\\\"]?(.*?)['\\\"]?\\)").find(bannerStyle)?.groupValues?.get(1)?.let { URI("$BASE/").resolve(it).toString() }.orEmpty()
         val poster = doc.selectFirst("img.film-poster-img")?.let { it.attr("data-src").ifBlank { it.attr("src") } }.orEmpty()
         val synopsis = doc.selectFirst(".film-description .text, .film-description, .description")?.text()?.take(500).orEmpty()
-        anime.copy(banner = banner, poster = poster.ifBlank { anime.poster }, synopsis = findTmdbSynopsis(anime) ?: if (synopsis.isBlank()) anime.synopsis else translatePtBr(synopsis))
+        val sourceText = synopsis.ifBlank { anime.synopsis }.takeUnless { it.equals("null", true) || it.equals("undefined", true) }.orEmpty()
+        val localized = findTmdbSynopsis(anime) ?: sourceText.takeIf { it.isNotBlank() }?.let { text ->
+            translatePtBr(text).takeUnless { it.equals(text, ignoreCase = true) }
+        }.orEmpty()
+        anime.copy(banner = banner, poster = poster.ifBlank { anime.poster }, synopsis = localized)
     }
 
     suspend fun resolve(anime: Anime, episode: Episode, dubbed: Boolean, openSubtitlesEnabled: Boolean, openSubtitlesApiKey: String): PlaybackSource = withContext(Dispatchers.IO) {
@@ -376,30 +380,51 @@ class HiAnimeRepository {
             Anime(slug, title, poster, synopsis = card.selectFirst(".description")?.text().orEmpty().take(500), metadata = card.select(".fdi-item").map { it.text() }.take(4))
         }.distinctBy { it.slug }.take(36)
 
-    suspend fun catalogSynopsis(anime: Anime): Anime = withContext(Dispatchers.IO) {
-        val cached = synopsisCache[anime.slug]
-        if (cached != null) return@withContext anime.copy(synopsis = cached)
-        val synopsis = findTmdbSynopsis(anime) ?: run {
-            val text = anime.synopsis.ifBlank {
-                runCatching { Jsoup.parse(fetch("$BASE/${anime.slug}")).selectFirst(".film-description .text, .film-description, .description")?.text().orEmpty().take(500) }.getOrDefault("")
-            }
-            if (text.isNotBlank()) translatePtBr(text).takeUnless { it == text }.orEmpty() else ""
-        }
-        if (synopsis.isNotBlank()) synopsisCache[anime.slug] = synopsis
-        anime.copy(synopsis = synopsis)
-    }
-
     fun findTmdbSynopsis(anime: Anime): String? {
         val key = TMDB_KEY_BYTES.map { (it xor 83).toChar() }.joinToString("")
+        val title = anime.title.replace(Regex("(?i)\\b(?:season\\s*\\d+|temporada\\s*\\d+|\\d+(?:st|nd|rd|th)\\s+season|movie|filme|dublado|legendado)\\b"), " ").replace(Regex("\\s+"), " ").trim()
+        if (title.isBlank()) return null
+        val query = URLEncoder.encode(title, Charsets.UTF_8.name())
+        val apiKey = URLEncoder.encode(key, Charsets.UTF_8.name())
+        val formats = when (explicitFormat(anime.title, anime.metadata)) {
+            "MOVIE" -> listOf("movie")
+            "TV" -> listOf("tv")
+            else -> listOf("tv", "movie")
+        }
+        val found = mutableListOf<String>()
+        for (format in formats) {
+            val synopsis = runCatching {
+                val response = org.json.JSONObject(fetch("https://api.themoviedb.org/3/search/$format?api_key=$apiKey&language=pt-BR&query=$query", "https://www.themoviedb.org/"))
+                val results = response.optJSONArray("results") ?: return@runCatching null
+                val candidates = (0 until results.length()).mapNotNull { results.optJSONObject(it) }.map { row ->
+                    val names = if (format == "movie") listOf(row.optString("title"), row.optString("original_title")) else listOf(row.optString("name"), row.optString("original_name"))
+                    SynopsisCandidate(row.optString("overview"), names)
+                }
+                chooseLocalizedSynopsis(title, if (format == "movie") "MOVIE" else "TV", candidates)
+            }.getOrNull()
+            if (!synopsis.isNullOrBlank()) found.add(synopsis)
+        }
+        return found.distinct().singleOrNull()
+    }
+
+    fun findSeasonPoster(anime: Anime, season: Int): String? {
+        if (season < 1) return null
+        val key = TMDB_KEY_BYTES.map { (it xor 83).toChar() }.joinToString("")
+        val title = anime.title.substringBefore(" · Temporada").trim()
+        if (title.isBlank()) return null
         return runCatching {
-            val query = URLEncoder.encode(anime.title.replace(Regex("(?i)\\b(?:season\\s*\\d+|\\d+(?:st|nd|rd|th)\\s+season)\\b"), " ").trim(), Charsets.UTF_8.name())
+            val query = URLEncoder.encode(title, Charsets.UTF_8.name())
             val apiKey = URLEncoder.encode(key, Charsets.UTF_8.name())
-            val results = org.json.JSONObject(fetch("https://api.themoviedb.org/3/search/tv?api_key=$apiKey&language=pt-BR&query=$query", "https://www.themoviedb.org/")).optJSONArray("results") ?: return null
-            (0 until results.length()).mapNotNull { results.optJSONObject(it) }
-                 .filter { it.optString("overview").isNotBlank() && !it.optString("overview").equals("null", ignoreCase = true) }
-                .map { row -> row to maxOf(titleSimilarity(anime.title, row.optString("original_name")), titleSimilarity(anime.title, row.optString("name"))) }
-                .filter { it.second >= 0.85 }
-                .maxByOrNull { it.second }?.first?.optString("overview")?.takeIf { it.isNotBlank() }
+            val rows = org.json.JSONObject(fetch("https://api.themoviedb.org/3/search/tv?api_key=$apiKey&language=pt-BR&query=$query", "https://www.themoviedb.org/")).optJSONArray("results") ?: return null
+            val matches = (0 until rows.length()).mapNotNull { rows.optJSONObject(it) }.mapNotNull { row ->
+                val score = identityScore(title, "TV", listOf(row.optString("name"), row.optString("original_name")), null) ?: return@mapNotNull null
+                row to score
+            }.sortedByDescending { it.second }
+            if (matches.isEmpty() || matches.size > 1 && matches[0].second - matches[1].second < .05) return null
+            val id = matches[0].first.optInt("id").takeIf { it > 0 } ?: return null
+            val seasonData = org.json.JSONObject(fetch("https://api.themoviedb.org/3/tv/$id/season/$season?api_key=$apiKey&language=pt-BR", "https://www.themoviedb.org/"))
+            val path = seasonData.optString("poster_path").takeIf { it.startsWith("/") && !it.startsWith("//") } ?: return null
+            "https://image.tmdb.org/t/p/w780$path"
         }.getOrNull()
     }
 
@@ -410,7 +435,10 @@ class HiAnimeRepository {
             val query = URLEncoder.encode(text, Charsets.UTF_8.name())
             val response = org.json.JSONObject(fetch("https://api.mymemory.translated.net/get?q=$query&langpair=en|pt-BR", "https://mymemory.translated.net/"))
             val translated = response.optJSONObject("responseData")?.optString("translatedText").orEmpty()
-            (if (response.optInt("responseStatus") == 200 && translated.isNotBlank()) translated else text).also { translationCache[text] = it }
+            if (response.optInt("responseStatus") == 200 && translated.isNotBlank() && !translated.equals("null", true) && translated != text) {
+                translationCache[text] = translated
+                translated
+            } else text
         }.getOrElse { text }
     }
 
@@ -475,7 +503,8 @@ class HiAnimeRepository {
             "castelo animado" to listOf("Howl no Ugoku Shiro", "Howl's Moving Castle"),
             "meu vizinho totoro" to listOf("Tonari no Totoro", "My Neighbor Totoro"),
         )
-        private val synopsisCache = java.util.concurrent.ConcurrentHashMap<String, String>()
-        private val translationCache = java.util.concurrent.ConcurrentHashMap<String, String>()
+        private val translationCache = java.util.Collections.synchronizedMap(object : LinkedHashMap<String, String>(128, .75f, true) {
+            override fun removeEldestEntry(eldest: MutableMap.MutableEntry<String, String>?): Boolean = size > 128
+        })
     }
 }
