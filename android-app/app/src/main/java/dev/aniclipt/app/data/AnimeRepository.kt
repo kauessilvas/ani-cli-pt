@@ -1,6 +1,5 @@
 package dev.aniclipt.app.data
 
-import android.util.Base64
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.async
 import kotlinx.coroutines.awaitAll
@@ -21,26 +20,42 @@ data class Anime(
     val banner: String = "",
     val synopsis: String = "",
     val metadata: List<String> = emptyList(),
+    val alternatives: List<Anime> = emptyList(),
 )
 
-data class Episode(val id: String, val number: String, val title: String, val originalTitle: String = title)
-data class PlaybackSource(val videoUrl: String, val subtitleUrl: String?, val referer: String, val title: String, val episode: String, val audioLabel: String, val subtitleLabel: String, val availableVideoHeights: List<Int> = emptyList())
+data class Episode(val id: String, val number: String, val title: String, val originalTitle: String = title, val thumbnail: String = "")
+data class PlaybackSource(val videoUrl: String, val subtitleUrl: String?, val referer: String, val title: String, val episode: String, val audioLabel: String, val subtitleLabel: String, val availableVideoHeights: List<Int> = emptyList(), val providerSlug: String = "")
+
+class DubSuggestion(val dubbed: PlaybackSource, val english: PlaybackSource?) : Exception("Dublagem PT-BR disponível")
 
 class AnimeRepository {
+    private val hi = HiAnimeRepository()
     suspend fun airing(): List<Anime> = withContext(Dispatchers.IO) {
-        parseCatalog(fetch("$BASE/top-airing"))
+        fireCatalog("$FIRE_BASE/animes?v=3")
     }
 
     suspend fun search(query: String): List<Anime> = withContext(Dispatchers.IO) {
-        val aliases = titleSearchAliases[normalizeMatchText(query)].orEmpty()
-        coroutineScope {
-            val catalogs = (aliases + query).distinctBy(::normalizeMatchText).take(3).map { searchTerm ->
-                async {
-                    val encoded = URLEncoder.encode(searchTerm, Charsets.UTF_8.name())
-                    parseCatalog(fetch("$BASE/search?keyword=$encoded"))
-                }
-            }.awaitAll().flatten().distinctBy { it.slug }.take(36)
-            catalogs
+        suspend fun fetchSource(name: String): List<Anime> = when (name) {
+            "AnimeFire" -> fireCatalog("$FIRE_BASE/animes/pesquisar?v=3&q=${URLEncoder.encode(query, Charsets.UTF_8.name())}")
+            "AnimesDigital" -> digitalSearch(query)
+            "HiAnime" -> hi.search(query).map { it.copy(slug = "hi:" + it.slug, metadata = it.metadata + "HiAnime") }
+            "AnimeDrive" -> externalSearch(query, "https://animesdrive.cloud", false)
+            "Goyabu" -> externalSearch(query, "https://goyabu.io", true)
+            else -> emptyList()
+        }
+        val results = coroutineScope {
+            listOf("AnimeFire", "AnimesDigital", "AnimeDrive", "Goyabu", "HiAnime").map { name -> async { runCatching { fetchSource(name) }.getOrDefault(emptyList()) } }.awaitAll().flatten()
+        }.toMutableList()
+        val identities = runCatching { aniListSearch(query) }.getOrDefault(emptyList())
+        val relatedQueries = identities.take(3).mapNotNull { it.romaji.takeIf(String::isNotBlank) }.distinct().filterNot { normalizeMatchText(it) == normalizeMatchText(query) }.take(2)
+        results += coroutineScope { relatedQueries.map { alias -> async { runCatching { digitalSearch(alias) }.getOrDefault(emptyList()) } }.awaitAll().flatten() }
+        results.distinctBy { it.slug }.forEach { item ->
+            val matched = identities.mapNotNull { identity -> identityScore(item.title, identity)?.let { identity to it } }.sortedByDescending { it.second }
+            if (matched.isNotEmpty() && (matched.size == 1 || matched[0].second - matched[1].second >= .12)) canonicalTitles[normalizeMatchText(item.title)] = matched[0].first.id
+        }
+        results.distinctBy { it.slug }.groupBy { matchTitle(it.title) }.values.map { group ->
+            val preferred = group.firstOrNull { !it.title.contains("dublado", true) } ?: group.first()
+            preferred.copy(alternatives = group.filterNot { it.slug == preferred.slug })
         }
     }
 
@@ -67,280 +82,259 @@ class AnimeRepository {
     }
 
     suspend fun episodes(anime: Anime): List<Episode> = withContext(Dispatchers.IO) {
-        val id = anime.slug.substringAfterLast('-')
-        val json = org.json.JSONObject(fetch("$BASE/api/theme/episode/list/$id"))
-        val listed = Jsoup.parseBodyFragment(json.optString("html")).select("a.ep-item[data-number]").mapNotNull { element ->
-            val episodeId = element.attr("data-id")
-            val number = element.attr("data-number")
-            val title = element.attr("title").ifBlank { "Episódio $number" }
-            if (episodeId.isBlank() || number.isBlank()) null else Episode(episodeId, number, title, title)
-        }
-        val semaphore = Semaphore(4)
-        listed.map { episode -> async {
-            val genericTitle = Regex("^(episode|epis[oó]dio)\\s*${Regex.escape(episode.number)}$", RegexOption.IGNORE_CASE)
-            if (genericTitle.matches(episode.title)) episode.copy(title = "Episódio ${episode.number}")
-            else semaphore.withPermit { episode.copy(title = translatePtBr(episode.title)) }
-        } }.awaitAll()
+        if (anime.slug.startsWith("https://animesdrive.cloud/") || anime.slug.startsWith("https://goyabu.io/")) return@withContext externalEpisodes(anime)
+        if (anime.slug.startsWith("hi:")) return@withContext hi.episodes(anime.copy(slug = anime.slug.removePrefix("hi:")))
+        if (anime.slug.startsWith("https://animesdigital.org/")) return@withContext digitalEpisodes(anime)
+        val data = fireAnime(anime)
+        val season = anime.slug.substringAfter("#s", "1").toIntOrNull() ?: 1
+        val array = data.optJSONArray("episodes") ?: return@withContext emptyList()
+        (0 until array.length()).mapNotNull { i -> array.optJSONObject(i)?.let { item ->
+            val id = item.optString("id"); val number = item.optInt("number", 0)
+            if (id.isBlank() || number <= 0 || item.optInt("season", 1) != season) null
+            else Episode(id, number.toString(), item.optString("title").ifBlank { "Episódio $number" }, thumbnail = item.optString("still_src").takeUnless { it == "null" }.orEmpty())
+        } }
+
     }
 
     suspend fun seasons(anime: Anime): List<Anime> = withContext(Dispatchers.IO) {
-        val doc = Jsoup.parse(fetch("$BASE/${anime.slug}"))
-        val relatedSection = doc.select("section").firstOrNull { section ->
-            section.selectFirst(".cat-heading")?.text()?.contains("Related Anime", ignoreCase = true) == true
-        }
-        val related = relatedSection?.select("a.dynamic-name").orEmpty().mapNotNull { link ->
-            val slug = URI(BASE).resolve(link.attr("href")).path.trim('/')
-            val title = link.text().ifBlank { link.attr("title") }
-            if (slug.isBlank() || title.isBlank()) return@mapNotNull null
-            val detail = link.closest(".film-detail")
-            val infoText = detail?.selectFirst(".fd-infor")?.text().orEmpty()
-            if (!Regex("\\bTV\\b", RegexOption.IGNORE_CASE).containsMatchIn(infoText)) return@mapNotNull null
-            val metadata = detail?.select(".fdi-item")?.map { it.text() }.orEmpty().ifEmpty { listOf("TV") }
-            Anime(slug, title, metadata = metadata)
-        }
-        val base = seasonFamily(anime.title)
-        (listOf(anime) + related)
-            .distinctBy { it.slug }
-            .filter { candidate -> seasonFamily(candidate.title) == base }
-            .sortedWith(compareBy<Anime> { seasonNumber(it.title) ?: 1 }.thenBy { it.slug })
+        if (anime.slug.startsWith("https://animesdrive.cloud/") || anime.slug.startsWith("https://goyabu.io/")) return@withContext listOf(anime)
+        if (anime.slug.startsWith("hi:")) return@withContext hi.seasons(anime.copy(slug = anime.slug.removePrefix("hi:"))).map { it.copy(slug = "hi:" + it.slug) }
+        if (anime.slug.startsWith("https://animesdigital.org/")) return@withContext listOf(anime)
+        val data = fireAnime(anime)
+        val seasons = data.optJSONArray("seasons") ?: return@withContext listOf(anime)
+        (0 until seasons.length()).mapNotNull { i -> seasons.optJSONObject(i)?.optInt("number", 0)?.takeIf { it > 0 }?.let { n -> anime.copy(slug = anime.slug.substringBefore("#s") + "#s$n", title = anime.title.substringBefore(" · Temporada") + " · Temporada $n") } }.ifEmpty { listOf(anime) }
+
     }
+
+    private fun cleanSynopsis(value: String): String = value.trim().takeUnless {
+        it.isBlank() || it.equals("null", ignoreCase = true) || it.equals("undefined", ignoreCase = true)
+    }.orEmpty()
 
     suspend fun artwork(anime: Anime): Anime = withContext(Dispatchers.IO) {
-        val doc = runCatching { Jsoup.parse(fetch("$BASE/${anime.slug}")) }.getOrElse { Jsoup.parse("") }
-        val bannerStyle = doc.selectFirst(".anis-cover")?.attr("style").orEmpty()
-        val banner = Regex("url\\(['\\\"]?(.*?)['\\\"]?\\)").find(bannerStyle)?.groupValues?.get(1)?.let { URI("$BASE/").resolve(it).toString() }.orEmpty()
-        val poster = doc.selectFirst("img.film-poster-img")?.let { it.attr("data-src").ifBlank { it.attr("src") } }.orEmpty()
-        val synopsis = doc.selectFirst(".film-description .text, .film-description, .description")?.text()?.take(500).orEmpty()
-        anime.copy(banner = banner, poster = poster.ifBlank { anime.poster }, synopsis = findTmdbSynopsis(anime) ?: if (synopsis.isBlank()) anime.synopsis else translatePtBr(synopsis))
-    }
-
-    suspend fun resolve(anime: Anime, episode: Episode, dubbed: Boolean, openSubtitlesEnabled: Boolean, openSubtitlesApiKey: String): PlaybackSource = withContext(Dispatchers.IO) {
-        val serverResponse = fetch("$BASE/api/theme/episode/servers?episodeId=${episode.id}")
-        val serverHtml = runCatching { org.json.JSONObject(serverResponse).optString("html") }.getOrDefault("").ifBlank { serverResponse }
-        val serversDoc = Jsoup.parse(serverHtml)
-        val servers = serversDoc.select(".server-item")
-        val ptBrDub = servers.firstOrNull { server ->
-            server.attr("data-type").equals("dub", true) && server.attr("data-server-name").equals("ZokoAnime", true) && Regex("pt[-_ ]?br|brazil|brasil", RegexOption.IGNORE_CASE)
-                .containsMatchIn(listOf("data-lang", "data-language", "data-label", "title", "data-server-name").joinToString(" ") { server.attr(it) } + " " + server.text())
+        val details = runCatching { when {
+            anime.slug.startsWith("https://animesdrive.cloud/") || anime.slug.startsWith("https://goyabu.io/") -> externalArtwork(anime)
+            anime.slug.startsWith("hi:") -> hi.artwork(anime.copy(slug = anime.slug.removePrefix("hi:"))).copy(slug = anime.slug)
+            anime.slug.startsWith("https://animesdigital.org/") -> anime
+            else -> {
+                val hero = fireAnime(anime).optJSONObject("hero")
+                if (hero == null) anime else anime.copy(
+                    banner = hero.optString("backdrop_src").takeUnless { it == "null" }.orEmpty().ifBlank { anime.banner },
+                    poster = hero.optString("poster_src").takeUnless { it == "null" }.orEmpty().ifBlank { anime.poster },
+                    synopsis = cleanSynopsis(hero.optString("synopsis")).ifBlank { cleanSynopsis(anime.synopsis) },
+                )
+            }
+        } }.getOrDefault(anime)
+        val synopsis = cleanSynopsis(details.synopsis).ifBlank {
+            runCatching { cleanSynopsis(hi.findTmdbSynopsis(anime).orEmpty()) }.getOrDefault("")
+        }.ifBlank {
+            val candidates = mutableListOf<String>()
+            for (alternate in anime.alternatives.take(3)) {
+                val synopsis = runCatching {
+                    val candidate = when {
+                        alternate.slug.startsWith("hi:") -> hi.artwork(alternate.copy(slug = alternate.slug.removePrefix("hi:")))
+                        alternate.slug.startsWith("https://animesdrive.cloud/") || alternate.slug.startsWith("https://goyabu.io/") -> externalArtwork(alternate)
+                        !alternate.slug.startsWith("https://") -> {
+                            val hero = fireAnime(alternate).optJSONObject("hero")
+                            alternate.copy(synopsis = hero?.optString("synopsis").orEmpty())
+                        }
+                        else -> alternate
+                    }
+                    cleanSynopsis(candidate.synopsis).takeIf { it.isNotBlank() }
+                }.getOrNull()
+                if (!synopsis.isNullOrBlank()) { candidates.add(synopsis); break }
+            }
+            candidates.firstOrNull().orEmpty()
         }
-        val originalServer = servers.firstOrNull { server ->
-            server.attr("data-type").equals("sub", true) && server.attr("data-server-name").equals("ZokoAnime", true)
+        details.copy(synopsis = synopsis)
+    }
+
+    suspend fun resolve(anime: Anime, episode: Episode, dubbed: Boolean, openSubtitlesEnabled: Boolean, openSubtitlesApiKey: String, excludedSources: Set<String> = emptySet()): PlaybackSource = withContext(Dispatchers.IO) {
+        val seasonAmbiguous = anime.slug.substringAfter("#s", "1").toIntOrNull()?.let { it > 1 } == true || Regex("(?i)\\b(?:season\\s*[2-9]|[2-9](?:nd|rd|th)\\s+season|temporada\\s*[2-9])\\b").containsMatchIn(anime.title)
+        val discovered = if (seasonAmbiguous) emptyList() else runCatching { search(anime.title).flatMap { listOf(it) + it.alternatives } }.getOrDefault(emptyList())
+        val candidates = (listOf(anime) + anime.alternatives + discovered).filter { it.slug !in excludedSources && (it.slug == anime.slug || matchTitle(it.title) == matchTitle(anime.title)) }.distinctBy { it.slug }.take(10)
+        val matched = candidates.mapNotNull { candidate ->
+            val ep = if (candidate.slug == anime.slug) episode else runCatching { episodes(candidate).firstOrNull { it.number.toDoubleOrNull() != null && it.number.toDoubleOrNull() == episode.number.toDoubleOrNull() } }.getOrNull()
+            ep?.let { candidate to it }
         }
-        val server = (if (dubbed) ptBrDub ?: originalServer else originalServer)
-            ?: error(if (dubbed) "Não há áudio PT-BR nem áudio original disponível para este episódio." else "A fonte compatível não está disponível para este episódio.")
-        val audioLabel = when {
-            dubbed && ptBrDub != null -> "Dublado PT-BR"
-            dubbed -> "Áudio original · dublagem PT-BR indisponível"
-            else -> "Áudio original"
+        suspend fun attempt(candidate: Anime, ep: Episode, audioDub: Boolean, allowOpen: Boolean): PlaybackSource? =
+            runCatching { resolveSingle(candidate, ep, audioDub, allowOpen, openSubtitlesApiKey).copy(providerSlug = candidate.slug) }.getOrNull()
+        fun score(value: PlaybackSource) = value.availableVideoHeights.maxOrNull() ?: -1
+        if (dubbed) {
+            val options = matched.mapNotNull { (candidate, ep) -> attempt(candidate, ep, true, openSubtitlesEnabled) }
+            return@withContext options.filter { it.audioLabel.contains("Dublado", true) && !it.audioLabel.contains("indisponível", true) }.maxByOrNull(::score)
+                ?: options.firstOrNull() ?: throw IllegalStateException("Episódio indisponível nas fontes encontradas.")
         }
-        val embed = Base64.decode(server.attr("data-hash"), Base64.DEFAULT).toString(Charsets.UTF_8)
-        val referer = URI(embed).resolve("/").toString()
-        val embedHtml = fetch(embed, referer)
-        val blob = Regex("window\\.__P=\"([^\"]+)\"").find(embedHtml)?.groupValues?.get(1)
-            ?: error("Não foi possível ler a configuração da fonte.")
-        val json = org.json.JSONObject(deobfuscate(blob))
-        val playlistUrl = json.optString("src").takeIf { it.contains(".m3u8") }
-            ?: error("A fonte não forneceu uma playlist HLS.")
-        val playlist = fetch(playlistUrl, referer)
-        val sourceFrameRate = Regex("FRAME-RATE=([0-9.]+)").find(playlist)?.groupValues?.get(1)?.toDoubleOrNull()
-        val sourceTracks = json.optJSONArray("subtitles")
-        val sourcePtBr = choosePtBrSubtitle(sourceTracks)
-        val openSubtitle = if (sourcePtBr == null && openSubtitlesEnabled && openSubtitlesApiKey.isNotBlank()) {
-            runCatching { findOpenSubtitlesPtBr(anime, episode, openSubtitlesApiKey, sourceFrameRate) }.getOrNull()
-        } else null
-        val sourceEnglish = if (sourcePtBr == null && openSubtitle == null) chooseEnglishSubtitle(sourceTracks) else null
-        val subtitle = sourcePtBr ?: openSubtitle?.url ?: sourceEnglish
-        val subtitleLabel = when {
-            sourcePtBr != null -> "Legenda PT-BR · fonte do vídeo"
-            openSubtitle != null -> "Legenda PT-BR · OpenSubtitles"
-            sourceEnglish != null -> "Legenda em inglês · fallback"
-            !openSubtitlesEnabled -> "Busca OpenSubtitles desativada"
-            openSubtitlesApiKey.isBlank() -> "Sem PT-BR · configure OpenSubtitles"
-            else -> "Sem legenda disponível"
+        val original = matched.mapNotNull { (candidate, ep) -> attempt(candidate, ep, false, false) }
+        val pt = original.filter { item ->
+            !item.audioLabel.contains("Dublado", true) && (item.subtitleLabel.contains("PT-BR", true) && !item.subtitleLabel.contains("Sem PT-BR", true) || (item.subtitleLabel == "Legenda da fonte" && (item.providerSlug.contains("animesdigital.org") || item.providerSlug.contains("#s"))))
         }
-        val availableHeights = Regex("(?m)^#EXT-X-STREAM-INF:([^\\n]*)")
-            .findAll(playlist)
-            .mapNotNull { Regex("RESOLUTION=\\d+x(\\d+)").find(it.groupValues[1])?.groupValues?.get(1)?.toIntOrNull() }
-            .distinct()
-            .sortedDescending()
-            .toList()
-        PlaybackSource(playlistUrl, subtitle, referer, anime.title, episode.number, audioLabel, subtitleLabel, availableHeights)
+        pt.maxByOrNull(::score)?.let { return@withContext it }
+        if (openSubtitlesEnabled && openSubtitlesApiKey.isNotBlank()) {
+            val external = matched.filter { it.first.slug.startsWith("hi:") }.mapNotNull { (candidate, ep) -> attempt(candidate, ep, false, true) }.filter { it.subtitleLabel.contains("OpenSubtitles", true) }
+            external.maxByOrNull(::score)?.let { return@withContext it }
+        }
+        val english = original.filter { it.subtitleLabel.contains("inglês", true) }.maxByOrNull(::score)
+        val dubbedOptions = matched.mapNotNull { (candidate, ep) -> attempt(candidate, ep, true, false) }.filter { it.audioLabel.contains("Dublado", true) && !it.audioLabel.contains("indisponível", true) }
+        val dubbedBest = dubbedOptions.maxByOrNull(::score)
+        if (dubbedBest != null) throw DubSuggestion(dubbedBest, english)
+        english ?: throw IllegalStateException("Nenhuma legenda PT-BR ou inglês foi identificada nas fontes disponíveis.")
     }
 
-    private fun choosePtBrSubtitle(tracks: org.json.JSONArray?): String? {
-        if (tracks == null) return null
-        val entries = (0 until tracks.length()).mapNotNull { tracks.optJSONObject(it) }
-        val ptBr = Regex("pt[-_ ]?br|brazil|brasileir|\\bpob\\b", RegexOption.IGNORE_CASE)
-        return entries.firstOrNull { track -> ptBr.containsMatchIn(track.optString("lang") + " " + track.optString("label") + " " + track.optString("src")) }
-            ?.optString("src")?.takeIf { it.isNotBlank() }
-    }
+    private data class AniIdentity(val id: Int, val format: String, val romaji: String, val titles: List<String>)
+    private val canonicalTitles = java.util.concurrent.ConcurrentHashMap<String, Int>()
+    private val aniCache = java.util.concurrent.ConcurrentHashMap<String, List<AniIdentity>>()
 
-    private fun chooseEnglishSubtitle(tracks: org.json.JSONArray?): String? {
-        if (tracks == null) return null
-        val entries = (0 until tracks.length()).mapNotNull { tracks.optJSONObject(it) }
-        val english = Regex("english|ingl[eê]s|\\beng\\b|/eng[-_.][^ ]*\\.vtt|eng-[0-9]+\\.vtt", RegexOption.IGNORE_CASE)
-        return entries.firstOrNull { track -> english.containsMatchIn(track.optString("lang") + " " + track.optString("label") + " " + track.optString("src")) }
-            ?.optString("src")?.takeIf { it.isNotBlank() }
-            ?: entries.firstOrNull { it.optBoolean("default") }?.optString("src")?.takeIf { it.isNotBlank() }
-    }
-
-    private data class ExternalSubtitle(val url: String, val durationSeconds: Double? = null)
-    private data class OpenSubtitleCandidate(
-        val fileId: Int,
-        val titleScore: Double,
-        val seriesScore: Double,
-        val frameRateDifference: Double,
-        val downloadCount: Int,
-    )
-    private class OpenSubtitlesApiException(val statusCode: Int) : Exception("OpenSubtitles HTTP $statusCode")
-
-    private fun findOpenSubtitlesPtBr(anime: Anime, episode: Episode, apiKey: String, sourceFrameRate: Double?): ExternalSubtitle? =
-        runCatching { findOpenSubtitlesPtBrOnce(anime, episode, apiKey, sourceFrameRate) }.getOrNull()
-
-    private fun findOpenSubtitlesPtBrOnce(anime: Anime, episode: Episode, apiKey: String, sourceFrameRate: Double?): ExternalSubtitle? {
-        val episodeNumber = episode.number.toDoubleOrNull()?.toInt() ?: return null
-        val cleanTitle = anime.title.replace(Regex("(?i)\\b(?:season\\s*\\d+|\\d+(?:st|nd|rd|th)\\s+season|part\\s*\\d+)\\b"), " ").trim()
-        val query = URLEncoder.encode(cleanTitle, Charsets.UTF_8.name())
-        val season = Regex("(?i)(?:season\\s*(\\d+)|(\\d+)(?:st|nd|rd|th)\\s+season|\\bs\\s*(\\d+)\\b)")
-            .find(anime.title)?.groupValues?.drop(1)?.firstOrNull { it.isNotBlank() }?.toIntOrNull()
-        val seasonParam = season?.let { "&season_number=$it" }.orEmpty()
-        val searchUrl = "$OPEN_SUBTITLES_BASE/subtitles?episode_number=$episodeNumber&languages=pt-br&order_by=download_count&order_direction=desc&query=$query&type=episode$seasonParam"
-        val search = openSubtitlesRequest(searchUrl, apiKey)
-        val rows = search.optJSONArray("data") ?: return null
-        val episodeTitle = usefulEpisodeTitle(episode.originalTitle)
-        val candidates = (0 until rows.length()).mapNotNull { index ->
-            val attributes = rows.optJSONObject(index)?.optJSONObject("attributes") ?: return@mapNotNull null
-            if (!attributes.optString("language").equals("pt-br", true)) return@mapNotNull null
-            val details = attributes.optJSONObject("feature_details")
-            val featureType = details?.optString("feature_type").orEmpty()
-            if (featureType.isNotBlank() && !featureType.equals("episode", true)) return@mapNotNull null
-
-            val release = attributes.optString("release")
-            val fileArray = attributes.optJSONArray("files") ?: return@mapNotNull null
-            val fileId = (0 until fileArray.length()).mapNotNull { fileArray.optJSONObject(it) }
-                .firstOrNull()?.optInt("file_id", 0)?.takeIf { it > 0 } ?: return@mapNotNull null
-            val fileName = (0 until fileArray.length()).mapNotNull { fileArray.optJSONObject(it) }
-                .firstOrNull()?.optString("file_name").orEmpty()
-            val releaseEpisode = parseSeasonEpisode("$release $fileName")
-            val resultEpisode = details?.optInt("episode_number", 0)?.takeIf { it > 0 } ?: releaseEpisode?.second
-            if (resultEpisode != null && resultEpisode != episodeNumber) return@mapNotNull null
-            val resultSeason = details?.optInt("season_number", 0)?.takeIf { it > 0 } ?: releaseEpisode?.first
-            if (season != null && resultSeason != null && resultSeason != season) return@mapNotNull null
-
-            val seriesTitles = listOf(
-                details?.optString("parent_title").orEmpty(),
-                details?.optString("movie_name").orEmpty().replace(Regex("(?i)\\s*[-:]?\\s*S\\d{1,2}E\\d{1,3}.*$"), ""),
-                release,
-                fileName,
-            ).filter { it.isNotBlank() }
-            val seriesScore = seriesTitles.maxOfOrNull { titleSimilarity(anime.title, it) } ?: 0.0
-            if (seriesScore < MIN_SERIES_TITLE_MATCH) return@mapNotNull null
-
-            val candidateEpisodeTitle = details?.optString("title").orEmpty()
-            val titleScore = if (episodeTitle.isBlank()) 0.0 else episodeTitleSimilarity(episodeTitle, candidateEpisodeTitle)
-            val subtitleFps = attributes.optDouble("fps", 0.0).takeIf { it > 0.0 }
-            val frameRateDifference = if (sourceFrameRate != null && subtitleFps != null) kotlin.math.abs(sourceFrameRate - subtitleFps) else Double.MAX_VALUE
-            OpenSubtitleCandidate(
-                fileId = fileId,
-                titleScore = titleScore,
-                seriesScore = seriesScore,
-                frameRateDifference = frameRateDifference,
-                downloadCount = attributes.optInt("download_count", 0),
-            )
-        }.sortedWith(
-            compareByDescending<OpenSubtitleCandidate> { it.titleScore }
-                .thenByDescending { it.seriesScore }
-                .thenBy { it.frameRateDifference }
-                .thenByDescending { it.downloadCount },
-        )
-        val candidate = candidates.firstOrNull() ?: return null
-        val subtitle = requestSubtitleDownload(candidate.fileId, apiKey) ?: return null
-        val expectedDuration = anime.metadata.mapNotNull(::runtimeSeconds).firstOrNull()
-        val subtitleDuration = subtitle.durationSeconds
-        if (expectedDuration != null && subtitleDuration != null &&
-            subtitleDuration !in expectedDuration * MIN_SUBTITLE_DURATION_RATIO..expectedDuration * MAX_SUBTITLE_DURATION_RATIO
-        ) return null
-        return subtitle
-    }
-
-    private fun requestSubtitleDownload(fileId: Int, apiKey: String): ExternalSubtitle? {
-        val request = URL("$OPEN_SUBTITLES_BASE/download").openConnection() as HttpURLConnection
-        request.requestMethod = "POST"
-        request.connectTimeout = 12_000
-        request.readTimeout = 20_000
-        request.doOutput = true
-        request.setRequestProperty("Api-Key", apiKey)
-        request.setRequestProperty("Content-Type", "application/json")
-        request.setRequestProperty("Accept", "application/json")
-        request.setRequestProperty("User-Agent", OPEN_SUBTITLES_USER_AGENT)
+    private fun aniListSearch(query: String): List<AniIdentity> {
+        val cacheKey = normalizeMatchText(query)
+        aniCache[cacheKey]?.let { return it }
+        val request = URL("https://graphql.anilist.co").openConnection() as HttpURLConnection
+        request.requestMethod = "POST"; request.doOutput = true; request.connectTimeout = 8000; request.readTimeout = 10000
+        request.setRequestProperty("Content-Type", "application/json"); request.setRequestProperty("Accept", "application/json")
+        val payload = org.json.JSONObject().put("query", "query (\$search: String) { Page(perPage: 8) { media(search: \$search, type: ANIME) { id format title { romaji english native } synonyms } } }").put("variables", org.json.JSONObject().put("search", query))
         return try {
-            request.outputStream.bufferedWriter(Charsets.UTF_8).use { it.write("{\"file_id\":$fileId,\"sub_format\":\"srt\"}") }
-            val code = request.responseCode
-            val body = (if (code in 200..299) request.inputStream else request.errorStream)?.bufferedReader(Charsets.UTF_8)?.use { it.readText() }.orEmpty()
-            if (code !in 200..299) throw OpenSubtitlesApiException(code)
-            val link = org.json.JSONObject(body).optString("link").takeIf { it.startsWith("https://") } ?: return null
-            ExternalSubtitle(link, fetchSubtitleDuration(link))
-        } finally {
-            request.disconnect()
-        }
+            request.outputStream.bufferedWriter().use { it.write(payload.toString()) }
+            if (request.responseCode !in 200..299) return emptyList()
+            val rows = org.json.JSONObject(request.inputStream.bufferedReader().use { it.readText() }).optJSONObject("data")?.optJSONObject("Page")?.optJSONArray("media") ?: return emptyList()
+            val identities = (0 until rows.length()).mapNotNull { i -> rows.optJSONObject(i)?.let { row ->
+                val title = row.optJSONObject("title") ?: return@let null
+                val aliases = mutableListOf(title.optString("romaji"), title.optString("english"), title.optString("native"))
+                val synonyms = row.optJSONArray("synonyms")
+                if (synonyms != null) for (j in 0 until synonyms.length()) aliases.add(synonyms.optString(j))
+                AniIdentity(row.optInt("id"), row.optString("format"), title.optString("romaji"), aliases.filter { it.isNotBlank() && it != "null" })
+            } }
+            identities.also { aniCache[cacheKey] = it }
+        } finally { request.disconnect() }
     }
 
-    private fun fetchSubtitleDuration(url: String): Double? {
-        val request = runCatching { URL(url).openConnection() as HttpURLConnection }.getOrNull() ?: return null
-        request.connectTimeout = 10_000
-        request.readTimeout = 12_000
-        request.setRequestProperty("Accept", "text/plain, */*")
-        request.setRequestProperty("User-Agent", OPEN_SUBTITLES_USER_AGENT)
-        val cuePattern = Regex("(\\d{2}:\\d{2}:\\d{2}[,.]\\d{3})\\s*-->\\s*(\\d{2}:\\d{2}:\\d{2}[,.]\\d{3})")
-        return try {
-            var consumedCharacters = 0
-            var lastEnd: Double? = null
-            request.inputStream.bufferedReader(Charsets.UTF_8).useLines { lines ->
-                lines.forEach { line ->
-                    consumedCharacters += line.length
-                    if (consumedCharacters > MAX_SUBTITLE_INSPECTION_CHARACTERS) return@useLines
-                    val times = cuePattern.find(line)?.groupValues ?: return@forEach
-                    lastEnd = timestampSeconds(times[2])
+    private fun identityScore(title: String, identity: AniIdentity): Double? {
+        val normalized = normalizeMatchText(title)
+        val movie = Regex("\\b(movie|filme|film)\\b").containsMatchIn(normalized)
+        val tv = Regex("\\b(tv|season|temporada)\\b").containsMatchIn(normalized)
+        if (movie && identity.format != "MOVIE" || tv && identity.format == "MOVIE") return null
+        fun tokens(value: String) = normalizeMatchText(value).split(' ').filter { it.length > 1 && it !in setOf("the", "movie", "filme", "film", "tv", "arc", "dublado", "legendado") }.toSet()
+        val input = tokens(title)
+        if (input.size < 2) return null
+        return identity.titles.maxOfOrNull { alias ->
+            val other = tokens(alias)
+            if (other.isEmpty()) 0.0 else input.intersect(other).size.toDouble() / minOf(input.size, other.size)
+        }?.takeIf { it >= .85 }
+    }
+    private fun matchTitle(title: String): String {
+        val cleaned = normalizeMatchText(title.replace(Regex("(?i)\\s*(?:[-–—]\\s*)?\\b(?:dublado|legendado)\\b\\s*$"), ""))
+        return canonicalTitles[normalizeMatchText(title)]?.let { "anilist:$it" } ?: cleaned
+    }
+    private suspend fun resolveSingle(anime: Anime, episode: Episode, dubbed: Boolean, openSubtitlesEnabled: Boolean, openSubtitlesApiKey: String): PlaybackSource = withContext(Dispatchers.IO) {
+        if (anime.slug.startsWith("https://animesdrive.cloud/") || anime.slug.startsWith("https://goyabu.io/")) return@withContext externalPlayback(anime, episode)
+        if (anime.slug.startsWith("hi:")) return@withContext hi.resolve(anime.copy(slug = anime.slug.removePrefix("hi:")), episode, dubbed, openSubtitlesEnabled, openSubtitlesApiKey)
+        if (anime.slug.startsWith("https://animesdigital.org/")) return@withContext digitalPlayback(anime, episode, dubbed)
+        val data = org.json.JSONObject(fetch("$FIRE_BASE/episode/${episode.id}?v=3", "https://animefire.one/")).getJSONObject("data")
+        val streams = data.optJSONArray("streams") ?: error("Nenhuma fonte disponível neste episódio.")
+        val preferred = if (dubbed) "dublado" else "legendado"
+        val available = (0 until streams.length()).mapNotNull { streams.optJSONObject(it) }
+        val stream = available.firstOrNull { it.optString("audio") == preferred && !it.optBoolean("is_offline") && it.optString("url").startsWith("https://") }
+            ?: (if (dubbed) available.firstOrNull { it.optString("audio") == "legendado" && !it.optBoolean("is_offline") && it.optString("url").startsWith("https://") } else null)
+            ?: error("Áudio solicitado indisponível neste episódio.")
+        val url = stream.optString("url")
+        val playlist = runCatching { fetch(url, "https://animefire.one/") }.getOrElse { error("AnimeFire: vídeo indisponível. Pesquise o mesmo título em outra fonte.") }
+        if (!playlist.startsWith("#EXTM3U")) error("A fonte não retornou um vídeo compatível.")
+        val heights = Regex("RESOLUTION=\\d+x(\\d+)").findAll(playlist).mapNotNull { it.groupValues[1].toIntOrNull() }.distinct().sortedDescending().toList()
+        PlaybackSource(url, null, "https://animefire.one/", anime.title, episode.number, if (stream.optString("audio") == "dublado") "Dublado PT-BR" else "Áudio original", if (stream.optString("audio") == "legendado") "Legenda da fonte" else "Áudio dublado", heights)
+
+    }
+
+    // Adapted provider code under the MIT license; see THIRD_PARTY_LICENSES.
+    private fun digitalSearch(query: String): List<Anime> {
+        val doc = Jsoup.parse(fetch("https://animesdigital.org/?s=${URLEncoder.encode(query, Charsets.UTF_8.name())}", "https://animesdigital.org/"))
+        return doc.select("a[href*=/anime/]").mapNotNull { link ->
+            val href = link.absUrl("href"); val uri = runCatching { URI(href) }.getOrNull()
+            if (uri?.host != "animesdigital.org" || uri.scheme != "https") return@mapNotNull null
+            val title = link.selectFirst(".title_anime")?.text().orEmpty().ifBlank { link.attr("title").removePrefix("Assistir ").substringBefore(" Online").trim() }
+            if (title.isBlank()) null else Anime(href, title, link.selectFirst("img")?.absUrl("src").orEmpty(), metadata = listOf("AnimesDigital"))
+        }.distinctBy { it.slug }.take(30)
+    }
+
+    private fun digitalEpisodes(anime: Anime): List<Episode> {
+        val first = Jsoup.parse(fetch(anime.slug, "https://animesdigital.org/"), anime.slug)
+        val maxPage = first.select("a[href*=/page/]").mapNotNull { Regex("/page/(\\d+)/?").find(it.attr("href"))?.groupValues?.get(1)?.toIntOrNull() }.maxOrNull()?.coerceAtMost(50) ?: 1
+        val docs = listOf(first) + (2..maxPage).map { page -> Jsoup.parse(fetch(anime.slug.trimEnd('/') + "/page/$page/", "https://animesdigital.org/"), anime.slug) }
+        return docs.flatMap { doc -> doc.select("a[href*=/video/]").mapNotNull { link ->
+            val href = link.absUrl("href"); val uri = runCatching { URI(href) }.getOrNull()
+            val number = Regex("(?i)(?:epis[oó]dio|ep\\.?)\\D*(\\d+(?:\\.\\d+)?)").find(link.text())?.groupValues?.get(1)
+            if (uri?.host != "animesdigital.org" || uri.scheme != "https" || number == null) null else Episode(href, number, "Episódio $number")
+        } }.distinctBy { it.id }.sortedBy { it.number.toDoubleOrNull() ?: Double.MAX_VALUE }
+    }
+
+    private fun digitalPlayback(anime: Anime, episode: Episode, dubbed: Boolean): PlaybackSource {
+        val isDubbed = anime.title.contains("dublado", true) || anime.slug.contains("dublado", true)
+        if (dubbed != isDubbed && isDubbed) error("Esta página é dublada. Escolha o resultado legendado do AnimesDigital.")
+        val doc = Jsoup.parse(fetch(episode.id, "https://animesdigital.org/"), episode.id)
+        val iframe = doc.select("iframe.metaframe.rptss, iframe.rptss.metaframe").mapNotNull { runCatching { URI(it.absUrl("src")) }.getOrNull() }.firstOrNull { it.host == "api.anivideo.net" && it.path.contains("videohls.php") } ?: error("Player compatível indisponível neste episódio.")
+        val url = android.net.Uri.parse(iframe.toString()).getQueryParameter("d").orEmpty()
+        if (!url.startsWith("https://")) error("Endereço de vídeo inválido.")
+        return PlaybackSource(url, null, "https://animesdigital.org/", anime.title, episode.number, if (isDubbed) "Dublado" else "Áudio original", if (isDubbed) "Dublado" else "Legenda da fonte")
+    }
+
+    private fun externalSearch(query: String, base: String, goyabu: Boolean): List<Anime> {
+        val encoded = URLEncoder.encode(query, Charsets.UTF_8.name())
+        if (goyabu) {
+            val homepage = fetch("$base/", "$base/")
+            val nonce = Regex("\"nonce\"\\s*:\\s*\"([a-f0-9]+)\"").find(homepage)?.groupValues?.get(1)
+            if (nonce != null) {
+                val json = runCatching { org.json.JSONObject(fetch("$base/wp-json/animeonline/search/?keyword=$encoded&nonce=$nonce", "$base/")) }.getOrNull()
+                if (json != null) {
+                    val items = json.keys().asSequence().mapNotNull { json.optJSONObject(it) }.mapNotNull { item ->
+                        val url = runCatching { URI(base).resolve(item.optString("url")) }.getOrNull(); val title = item.optString("title")
+                        if (url?.host != URI(base).host || url.scheme != "https" || title.isBlank()) null else Anime(url.toString(), title, item.optString("img"), metadata = listOf("Goyabu"))
+                    }.toList()
+                    if (items.isNotEmpty()) return items
                 }
             }
-            lastEnd
-        } catch (_: Exception) {
-            null
-        } finally {
-            request.disconnect()
         }
+        val doc = Jsoup.parse(fetch("$base/?s=$encoded", "$base/"), base)
+        val selector = if (goyabu) "article a[href], .anime-item a[href], .post a[href]" else "div.result-item article, article.w_item_a, article.item"
+        return doc.select(selector).mapNotNull { card ->
+            val link = if (goyabu) card else card.selectFirst("div.title a[href], div.details .title a[href], a[href]") ?: return@mapNotNull null
+            val url = link.absUrl("href"); val uri = runCatching { URI(url) }.getOrNull()
+            if (uri?.host != URI(base).host || uri.scheme != "https" || !uri.path.contains("/anime/")) return@mapNotNull null
+            val title = if (goyabu) card.selectFirst("h3, h2")?.text().orEmpty().ifBlank { card.selectFirst("img")?.attr("alt").orEmpty() } else card.selectFirst("div.title a, div.details .title a")?.text().orEmpty().ifBlank { card.selectFirst("h3,h2")?.text().orEmpty() }.ifBlank { card.selectFirst("img")?.attr("alt").orEmpty() }
+            if (title.isBlank()) null else Anime(url, title, card.selectFirst("img")?.absUrl("src").orEmpty(), metadata = listOf(if (goyabu) "Goyabu" else "AnimeDrive"))
+        }.distinctBy { it.slug }.take(30)
     }
 
-    private fun timestampSeconds(value: String): Double? {
-        val pieces = value.replace(',', '.').split(':')
-        if (pieces.size != 3) return null
-        val seconds = pieces[2].toDoubleOrNull() ?: return null
-        return pieces[0].toIntOrNull()?.times(3600)?.plus(pieces[1].toIntOrNull()?.times(60) ?: return null)?.plus(seconds)
+    private fun externalArtwork(anime: Anime): Anime {
+        val doc = Jsoup.parse(fetch(anime.slug), anime.slug)
+        val synopsis = doc.selectFirst(".wp-content p, .description p, .sinopse, .description")?.text().orEmpty()
+        val image = doc.selectFirst(".poster img, .sheader .poster img, img.wp-post-image")?.absUrl("src").orEmpty()
+        return anime.copy(poster = image.ifBlank { anime.poster }, synopsis = synopsis.ifBlank { anime.synopsis })
     }
 
-    private fun runtimeSeconds(value: String): Double? {
-        val match = Regex("(?i)\\b(\\d{1,3})\\s*(?:m|min|mins|minutes?)\\b").find(value) ?: return null
-        return match.groupValues[1].toDoubleOrNull()?.times(60)
+    private fun externalEpisodes(anime: Anime): List<Episode> {
+        val html = fetch(anime.slug); val doc = Jsoup.parse(html, anime.slug)
+        if (anime.slug.startsWith("https://goyabu.io/")) {
+            val raw = Regex("(?:allEpisodes|episodes|episodeList|episodios)\\s*[:=]\\s*(\\[[\\s\\S]*?\\])").find(html)?.groupValues?.get(1)
+            val array = raw?.let { runCatching { org.json.JSONArray(it) }.getOrNull() }
+            if (array != null) return (0 until array.length()).mapNotNull { i -> array.optJSONObject(i)?.let { item -> val id = item.optString("id"); val n = item.optString("episodio").ifBlank { "${i + 1}" }; if (id.isBlank()) null else Episode("https://goyabu.io/?p=$id", n, "Episódio $n") } }.sortedBy { it.number.toDoubleOrNull() ?: Double.MAX_VALUE }
+        }
+        val links = doc.select(".episode-info .episode-title a[href], .episode-card a[href], #seasons .episodios li a[href], .episodios li a[href], .se-a a[href], #episodes a[href], .episodelist a[href]")
+        return links.mapNotNull { link -> val url = link.absUrl("href"); val uri = runCatching { URI(url) }.getOrNull(); if (uri?.host != URI(anime.slug).host || uri.scheme != "https" || !url.contains("episodio", true)) return@mapNotNull null; val n = Regex("(?i)episodios?[-_]?([0-9]+)").find(url)?.groupValues?.get(1) ?: Regex("[0-9]+").find(link.text())?.value ?: return@mapNotNull null; Episode(url, n, link.text().ifBlank { "Episódio $n" }) }.distinctBy { it.id }.sortedBy { it.number.toIntOrNull() ?: Int.MAX_VALUE }
     }
 
-    private fun usefulEpisodeTitle(value: String): String {
-        val normalized = normalizeMatchText(value).replace(Regex("^(?:episode|ep|episodio)\\s*\\d+\\s*"), "").trim()
-        return normalized.takeUnless { it.isBlank() || it.matches(Regex("\\d+")) }.orEmpty()
+    private fun externalPlayback(anime: Anime, episode: Episode): PlaybackSource {
+        val doc = Jsoup.parse(fetch(episode.id), episode.id)
+        val sources = doc.select(".animeq-player__source video source[src], .animeq-player__source video[src], video source[src], video[data-video-src]")
+        val urls = sources.map { it.absUrl("src").ifBlank { it.absUrl("data-video-src") } }.filter { it.startsWith("https://") }
+        val url = urls.firstOrNull { candidate -> runCatching { val c = URL(candidate).openConnection() as HttpURLConnection; c.requestMethod = "HEAD"; c.connectTimeout = 4000; c.readTimeout = 4000; c.setRequestProperty("Referer", "https://animesdrive.cloud/"); try { c.responseCode in 200..399 } finally { c.disconnect() } }.getOrDefault(false) } ?: urls.firstOrNull() ?: error("Nenhum vídeo direto compatível nesta fonte.")
+        return PlaybackSource(url, null, URI(anime.slug).let { "${it.scheme}://${it.host}/" }, anime.title, episode.number, "Áudio da fonte", "Legenda da fonte", emptyList())
     }
 
-    private fun titleSimilarity(first: String, second: String): Double {
-        val firstTokens = normalizeMatchText(first).split(' ').filter { it.length > 1 }.toSet()
-        val secondTokens = normalizeMatchText(second).split(' ').filter { it.length > 1 }.toSet()
-        if (firstTokens.isEmpty() || secondTokens.isEmpty()) return 0.0
-        val common = firstTokens.intersect(secondTokens).size.toDouble()
-        return common / minOf(firstTokens.size, secondTokens.size)
-    }
+    private fun fireAnime(anime: Anime): org.json.JSONObject = org.json.JSONObject(fetch("$FIRE_BASE/anime/${anime.slug.substringBefore("#s")}?v=3", "https://animefire.one/")).getJSONObject("data")
 
-    private fun episodeTitleSimilarity(first: String, second: String): Double {
-        val firstTokens = normalizeMatchText(first).split(' ').filter { it.length > 1 }.toSet()
-        val secondTokens = normalizeMatchText(second).split(' ').filter { it.length > 1 }.toSet()
-        if (firstTokens.isEmpty() || secondTokens.isEmpty()) return 0.0
-        return firstTokens.intersect(secondTokens).size.toDouble() / maxOf(firstTokens.size, secondTokens.size)
+    private fun fireCatalog(url: String): List<Anime> {
+        val array = org.json.JSONObject(fetch(url, "https://animefire.one/")).optJSONArray("data") ?: return emptyList()
+        return (0 until array.length()).mapNotNull { i -> array.optJSONObject(i)?.let { item ->
+            val id = item.optString("id"); val title = item.optJSONObject("titles")?.optString("BR").orEmpty()
+            if (id.isBlank() || title.isBlank()) null else Anime(id + "#s1", title, item.optString("poster_src"), metadata = listOf("AnimeFire", item.optString("audio").takeUnless { it == "null" }.orEmpty()).filter { it.isNotBlank() })
+        } }
     }
 
     private fun normalizeMatchText(value: String): String {
@@ -352,97 +346,8 @@ class AnimeRepository {
             .trim()
     }
 
-    private fun parseSeasonEpisode(value: String): Pair<Int, Int>? {
-        val seasonEpisode = Regex("(?i)\\bS(\\d{1,2})E(\\d{1,3})\\b").find(value)
-            ?: Regex("(?i)\\b(\\d{1,2})x(\\d{1,3})\\b").find(value)
-            ?: return null
-        return seasonEpisode.groupValues[1].toIntOrNull()?.let { season ->
-            seasonEpisode.groupValues[2].toIntOrNull()?.let { episode -> season to episode }
-        }
-    }
-
-    private fun openSubtitlesRequest(url: String, apiKey: String): org.json.JSONObject {
-        val request = URL(url).openConnection() as HttpURLConnection
-        request.connectTimeout = 12_000
-        request.readTimeout = 20_000
-        request.setRequestProperty("Api-Key", apiKey)
-        request.setRequestProperty("Accept", "application/json")
-        request.setRequestProperty("User-Agent", OPEN_SUBTITLES_USER_AGENT)
-        return try {
-            val code = request.responseCode
-            val body = (if (code in 200..299) request.inputStream else request.errorStream)?.bufferedReader(Charsets.UTF_8)?.use { it.readText() }.orEmpty()
-            if (code !in 200..299) throw OpenSubtitlesApiException(code) else org.json.JSONObject(body)
-        } finally {
-            request.disconnect()
-        }
-    }
-
-    private fun parseCatalog(html: String): List<Anime> =
-        Jsoup.parse(html).select(".flw-item").mapNotNull { card ->
-            val link = card.selectFirst("a.dynamic-name") ?: return@mapNotNull null
-            val slug = URI(BASE).resolve(link.attr("href")).path.trim('/')
-            val title = link.text().ifBlank { link.attr("title") }
-            if (slug.isBlank() || title.isBlank()) return@mapNotNull null
-            val image = card.selectFirst("img.film-poster-img")
-            val poster = image?.attr("data-src").orEmpty().ifBlank { image?.attr("src").orEmpty() }
-            Anime(slug, title, poster, synopsis = card.selectFirst(".description")?.text().orEmpty().take(500), metadata = card.select(".fdi-item").map { it.text() }.take(4))
-        }.distinctBy { it.slug }.take(36)
-
     suspend fun catalogSynopsis(anime: Anime): Anime = withContext(Dispatchers.IO) {
-        val cached = synopsisCache[anime.slug]
-        if (cached != null) return@withContext anime.copy(synopsis = cached)
-        val synopsis = findTmdbSynopsis(anime) ?: run {
-            val text = anime.synopsis.ifBlank {
-                runCatching { Jsoup.parse(fetch("$BASE/${anime.slug}")).selectFirst(".film-description .text, .film-description, .description")?.text().orEmpty().take(500) }.getOrDefault("")
-            }
-            if (text.isNotBlank()) translatePtBr(text).takeUnless { it == text }.orEmpty() else ""
-        }
-        if (synopsis.isNotBlank()) synopsisCache[anime.slug] = synopsis
-        anime.copy(synopsis = synopsis)
-    }
-
-    private fun findTmdbSynopsis(anime: Anime): String? {
-        val key = TMDB_KEY_BYTES.map { (it xor 83).toChar() }.joinToString("")
-        return runCatching {
-            val query = URLEncoder.encode(anime.title.replace(Regex("(?i)\\b(?:season\\s*\\d+|\\d+(?:st|nd|rd|th)\\s+season)\\b"), " ").trim(), Charsets.UTF_8.name())
-            val apiKey = URLEncoder.encode(key, Charsets.UTF_8.name())
-            val results = org.json.JSONObject(fetch("https://api.themoviedb.org/3/search/tv?api_key=$apiKey&language=pt-BR&query=$query", "https://www.themoviedb.org/")).optJSONArray("results") ?: return null
-            (0 until results.length()).mapNotNull { results.optJSONObject(it) }
-                 .filter { it.optString("overview").isNotBlank() }
-                .map { row -> row to maxOf(titleSimilarity(anime.title, row.optString("original_name")), titleSimilarity(anime.title, row.optString("name"))) }
-                .filter { it.second >= 0.85 }
-                .maxByOrNull { it.second }?.first?.optString("overview")?.takeIf { it.isNotBlank() }
-        }.getOrNull()
-    }
-
-    private fun translatePtBr(text: String): String {
-        if (text.isBlank() || text.length > 500) return text
-        translationCache[text]?.let { return it }
-        return runCatching {
-            val query = URLEncoder.encode(text, Charsets.UTF_8.name())
-            val response = org.json.JSONObject(fetch("https://api.mymemory.translated.net/get?q=$query&langpair=en|pt-BR", "https://mymemory.translated.net/"))
-            val translated = response.optJSONObject("responseData")?.optString("translatedText").orEmpty()
-            (if (response.optInt("responseStatus") == 200 && translated.isNotBlank()) translated else text).also { translationCache[text] = it }
-        }.getOrElse { text }
-    }
-
-    private fun seasonFamily(title: String): String = title.lowercase()
-        .replace(Regex("\\bthe\\s+final\\s+season\\b"), " ")
-        .replace(Regex("\\b\\d+(?:st|nd|rd|th)\\s+season\\b"), " ")
-        .replace(Regex("\\bseason\\s*\\d+\\b"), " ")
-        .replace(Regex("\\bpart\\s*\\d+\\b"), " ")
-        .replace(Regex("\\bcour\\s*\\d+\\b"), " ")
-        .replace(Regex("\\bs\\s*\\d+\\b"), " ")
-        .replace(Regex("[^a-z0-9]+"), " ")
-        .trim()
-
-    private fun seasonNumber(title: String): Int? = Regex("(?:season\\s*(\\d+)|(\\d+)(?:st|nd|rd|th)\\s+season|\\bs\\s*(\\d+)\\b)", RegexOption.IGNORE_CASE)
-        .find(title)?.groupValues?.drop(1)?.firstOrNull { it.isNotBlank() }?.toIntOrNull()
-
-    private fun deobfuscate(blob: String): String {
-        val bytes = Base64.decode(blob, Base64.DEFAULT)
-        val key = "otaku-embed-v1".encodeToByteArray()
-        return String(bytes.mapIndexed { index, byte -> (byte.toInt() xor key[index % key.size].toInt()).toByte() }.toByteArray(), Charsets.UTF_8)
+        runCatching { artwork(anime) }.getOrDefault(anime.copy(synopsis = cleanSynopsis(anime.synopsis)))
     }
 
     private fun fetch(url: String, referer: String = "$BASE/"): String {
@@ -457,37 +362,10 @@ class AnimeRepository {
     }
 
     companion object {
+        private const val FIRE_BASE = "https://api.animefire.one"
         const val BASE = "https://hianime.at"
-        private val TMDB_KEY_BYTES = intArrayOf(48, 50, 98, 53, 99, 96, 48, 49, 107, 103, 99, 98, 48, 48, 99, 54, 100, 106, 55, 50, 48, 55, 103, 98, 96, 98, 53, 107, 98, 49, 107, 99)
         private const val OPEN_SUBTITLES_BASE = "https://api.opensubtitles.com/api/v1"
         private const val USER_AGENT = "Mozilla/5.0 (Linux; Android 14; Pixel 8) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.0.0 Mobile Safari/537.36"
         private const val OPEN_SUBTITLES_USER_AGENT = "ani-cli-pt v0.1.7"
-        private const val MIN_SERIES_TITLE_MATCH = 0.5
-        private const val MIN_SUBTITLE_DURATION_RATIO = 0.60
-        private const val MAX_SUBTITLE_DURATION_RATIO = 1.15
-        private const val MAX_SUBTITLE_INSPECTION_CHARACTERS = 2_000_000
-        private val titleSearchAliases = mapOf(
-            "os sete pecados capitais" to listOf("Nanatsu no Taizai", "The Seven Deadly Sins"),
-            "sete pecados capitais" to listOf("Nanatsu no Taizai", "The Seven Deadly Sins"),
-            "nanatsu no taizai" to listOf("The Seven Deadly Sins"),
-            "the seven deadly sins" to listOf("Nanatsu no Taizai"),
-            "demon slayer" to listOf("Kimetsu no Yaiba"),
-            "matador de demonios" to listOf("Kimetsu no Yaiba", "Demon Slayer"),
-            "ataque dos titas" to listOf("Shingeki no Kyojin", "Attack on Titan"),
-            "ataque dos titans" to listOf("Shingeki no Kyojin", "Attack on Titan"),
-            "shingeki no kyojin" to listOf("Attack on Titan"),
-            "attack on titan" to listOf("Shingeki no Kyojin"),
-            "caderno da morte" to listOf("Death Note"),
-            "cacador x cacador" to listOf("Hunter x Hunter"),
-            "hunter x hunter" to listOf("Hunter x Hunter"),
-            "academia meu heroi" to listOf("Boku no Hero Academia", "My Hero Academia"),
-            "meu heroi academia" to listOf("Boku no Hero Academia", "My Hero Academia"),
-            "boku no hero academia" to listOf("My Hero Academia"),
-            "a viagem de chihiro" to listOf("Sen to Chihiro no Kamikakushi", "Spirited Away"),
-            "castelo animado" to listOf("Howl no Ugoku Shiro", "Howl's Moving Castle"),
-            "meu vizinho totoro" to listOf("Tonari no Totoro", "My Neighbor Totoro"),
-        )
-        private val synopsisCache = java.util.concurrent.ConcurrentHashMap<String, String>()
-        private val translationCache = java.util.concurrent.ConcurrentHashMap<String, String>()
     }
 }

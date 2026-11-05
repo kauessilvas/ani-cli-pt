@@ -170,4 +170,6 @@ cd android-app
 ./gradlew assembleDebug
 ```
 
-O APK será criado em `app/build/outputs/apk/debug/app-debug.apk`. O app busca fontes diretamente no HiAnime, então a disponibilidade do catálogo, dos episódios, das legendas e da reprodução depende do provedor e pode mudar.
+O APK será criado em `app/build/outputs/apk/debug/app-debug.apk`. O aplicativo consulta fontes diretamente no aparelho e tenta encontrar a melhor opção disponível, priorizando legendas em português. A disponibilidade do catálogo, dos episódios e da reprodução depende dos provedores e pode mudar.
+
+O player oferece controles de reprodução, progresso, velocidade, qualidade e proporção. A aparência de legendas separadas pode ser personalizada nas configurações; legendas gravadas na imagem não podem ser modificadas.
