@@ -76,7 +76,8 @@ class FavoriteEpisodeWorker(context: Context, params: WorkerParameters) : Corout
             .setContentIntent(pendingIntent)
             .setPriority(NotificationCompat.PRIORITY_DEFAULT)
             .build()
-        runCatching { NotificationManagerCompat.from(applicationContext).notify(anime.slug.hashCode(), notification) }
+        if (android.os.Build.VERSION.SDK_INT >= 33 && androidx.core.content.ContextCompat.checkSelfPermission(applicationContext, android.Manifest.permission.POST_NOTIFICATIONS) != android.content.pm.PackageManager.PERMISSION_GRANTED) return
+        try { NotificationManagerCompat.from(applicationContext).notify(anime.slug.hashCode(), notification) } catch (_: SecurityException) { }
     }
 
     companion object {

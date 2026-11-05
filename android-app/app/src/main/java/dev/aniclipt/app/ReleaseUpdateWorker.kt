@@ -156,7 +156,8 @@ class ReleaseUpdateWorker(context: Context, params: WorkerParameters) : Coroutin
             .setAutoCancel(true)
             .setPriority(NotificationCompat.PRIORITY_DEFAULT)
             .build()
-        runCatching { NotificationManagerCompat.from(applicationContext).notify(NOTIFICATION_ID, notification) }
+        if (android.os.Build.VERSION.SDK_INT >= 33 && androidx.core.content.ContextCompat.checkSelfPermission(applicationContext, android.Manifest.permission.POST_NOTIFICATIONS) != android.content.pm.PackageManager.PERMISSION_GRANTED) return
+        try { NotificationManagerCompat.from(applicationContext).notify(NOTIFICATION_ID, notification) } catch (_: SecurityException) { }
     }
 
     private fun compareVersions(first: String, second: String): Int {

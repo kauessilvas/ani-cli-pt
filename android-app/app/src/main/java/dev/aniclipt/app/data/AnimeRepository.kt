@@ -28,7 +28,7 @@ data class PlaybackSource(val videoUrl: String, val subtitleUrl: String?, val re
 
 class AnimeRepository {
     suspend fun airing(): List<Anime> = withContext(Dispatchers.IO) {
-        translateCatalog(parseCatalog(fetch("$BASE/top-airing")))
+        parseCatalog(fetch("$BASE/top-airing"))
     }
 
     suspend fun search(query: String): List<Anime> = withContext(Dispatchers.IO) {
@@ -40,7 +40,7 @@ class AnimeRepository {
                     parseCatalog(fetch("$BASE/search?keyword=$encoded"))
                 }
             }.awaitAll().flatten().distinctBy { it.slug }.take(36)
-            translateCatalog(catalogs)
+            catalogs
         }
     }
 
@@ -106,12 +106,12 @@ class AnimeRepository {
     }
 
     suspend fun artwork(anime: Anime): Anime = withContext(Dispatchers.IO) {
-        val doc = Jsoup.parse(fetch("$BASE/${anime.slug}"))
+        val doc = runCatching { Jsoup.parse(fetch("$BASE/${anime.slug}")) }.getOrElse { Jsoup.parse("") }
         val bannerStyle = doc.selectFirst(".anis-cover")?.attr("style").orEmpty()
         val banner = Regex("url\\(['\\\"]?(.*?)['\\\"]?\\)").find(bannerStyle)?.groupValues?.get(1)?.let { URI("$BASE/").resolve(it).toString() }.orEmpty()
         val poster = doc.selectFirst("img.film-poster-img")?.let { it.attr("data-src").ifBlank { it.attr("src") } }.orEmpty()
         val synopsis = doc.selectFirst(".film-description .text, .film-description, .description")?.text()?.take(500).orEmpty()
-        anime.copy(banner = banner, poster = poster.ifBlank { anime.poster }, synopsis = if (synopsis.isBlank()) anime.synopsis else translatePtBr(synopsis))
+        anime.copy(banner = banner, poster = poster.ifBlank { anime.poster }, synopsis = findTmdbSynopsis(anime) ?: if (synopsis.isBlank()) anime.synopsis else translatePtBr(synopsis))
     }
 
     suspend fun resolve(anime: Anime, episode: Episode, dubbed: Boolean, openSubtitlesEnabled: Boolean, openSubtitlesApiKey: String): PlaybackSource = withContext(Dispatchers.IO) {
@@ -388,12 +388,31 @@ class AnimeRepository {
             Anime(slug, title, poster, synopsis = card.selectFirst(".description")?.text().orEmpty().take(500), metadata = card.select(".fdi-item").map { it.text() }.take(4))
         }.distinctBy { it.slug }.take(36)
 
-    private suspend fun translateCatalog(anime: List<Anime>): List<Anime> = coroutineScope {
-        val distinctDescriptions = anime.asSequence().map { it.synopsis }.filter { it.isNotBlank() }.distinct().toList()
-        val semaphore = Semaphore(4)
-        val translations = distinctDescriptions.map { text -> async { text to semaphore.withPermit { translatePtBr(text) } } }
-            .awaitAll().toMap()
-        anime.map { item -> item.copy(synopsis = translations[item.synopsis] ?: item.synopsis) }
+    suspend fun catalogSynopsis(anime: Anime): Anime = withContext(Dispatchers.IO) {
+        val cached = synopsisCache[anime.slug]
+        if (cached != null) return@withContext anime.copy(synopsis = cached)
+        val synopsis = findTmdbSynopsis(anime) ?: run {
+            val text = anime.synopsis.ifBlank {
+                runCatching { Jsoup.parse(fetch("$BASE/${anime.slug}")).selectFirst(".film-description .text, .film-description, .description")?.text().orEmpty().take(500) }.getOrDefault("")
+            }
+            if (text.isNotBlank()) translatePtBr(text).takeUnless { it == text }.orEmpty() else ""
+        }
+        if (synopsis.isNotBlank()) synopsisCache[anime.slug] = synopsis
+        anime.copy(synopsis = synopsis)
+    }
+
+    private fun findTmdbSynopsis(anime: Anime): String? {
+        val key = TMDB_KEY_BYTES.map { (it xor 83).toChar() }.joinToString("")
+        return runCatching {
+            val query = URLEncoder.encode(anime.title.replace(Regex("(?i)\\b(?:season\\s*\\d+|\\d+(?:st|nd|rd|th)\\s+season)\\b"), " ").trim(), Charsets.UTF_8.name())
+            val apiKey = URLEncoder.encode(key, Charsets.UTF_8.name())
+            val results = org.json.JSONObject(fetch("https://api.themoviedb.org/3/search/tv?api_key=$apiKey&language=pt-BR&query=$query", "https://www.themoviedb.org/")).optJSONArray("results") ?: return null
+            (0 until results.length()).mapNotNull { results.optJSONObject(it) }
+                 .filter { it.optString("overview").isNotBlank() }
+                .map { row -> row to maxOf(titleSimilarity(anime.title, row.optString("original_name")), titleSimilarity(anime.title, row.optString("name"))) }
+                .filter { it.second >= 0.85 }
+                .maxByOrNull { it.second }?.first?.optString("overview")?.takeIf { it.isNotBlank() }
+        }.getOrNull()
     }
 
     private fun translatePtBr(text: String): String {
@@ -404,10 +423,7 @@ class AnimeRepository {
             val response = org.json.JSONObject(fetch("https://api.mymemory.translated.net/get?q=$query&langpair=en|pt-BR", "https://mymemory.translated.net/"))
             val translated = response.optJSONObject("responseData")?.optString("translatedText").orEmpty()
             (if (response.optInt("responseStatus") == 200 && translated.isNotBlank()) translated else text).also { translationCache[text] = it }
-        }.getOrElse {
-            translationCache.putIfAbsent(text, text)
-            text
-        }
+        }.getOrElse { text }
     }
 
     private fun seasonFamily(title: String): String = title.lowercase()
@@ -442,9 +458,10 @@ class AnimeRepository {
 
     companion object {
         const val BASE = "https://hianime.at"
+        private val TMDB_KEY_BYTES = intArrayOf(48, 50, 98, 53, 99, 96, 48, 49, 107, 103, 99, 98, 48, 48, 99, 54, 100, 106, 55, 50, 48, 55, 103, 98, 96, 98, 53, 107, 98, 49, 107, 99)
         private const val OPEN_SUBTITLES_BASE = "https://api.opensubtitles.com/api/v1"
         private const val USER_AGENT = "Mozilla/5.0 (Linux; Android 14; Pixel 8) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.0.0 Mobile Safari/537.36"
-        private const val OPEN_SUBTITLES_USER_AGENT = "ani-cli-pt v0.1.6"
+        private const val OPEN_SUBTITLES_USER_AGENT = "ani-cli-pt v0.1.7"
         private const val MIN_SERIES_TITLE_MATCH = 0.5
         private const val MIN_SUBTITLE_DURATION_RATIO = 0.60
         private const val MAX_SUBTITLE_DURATION_RATIO = 1.15
@@ -470,6 +487,7 @@ class AnimeRepository {
             "castelo animado" to listOf("Howl no Ugoku Shiro", "Howl's Moving Castle"),
             "meu vizinho totoro" to listOf("Tonari no Totoro", "My Neighbor Totoro"),
         )
+        private val synopsisCache = java.util.concurrent.ConcurrentHashMap<String, String>()
         private val translationCache = java.util.concurrent.ConcurrentHashMap<String, String>()
     }
 }

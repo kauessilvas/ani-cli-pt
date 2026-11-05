@@ -21,6 +21,8 @@ import android.widget.Toast
 import android.widget.TextView
 import androidx.activity.ComponentActivity
 import androidx.activity.compose.BackHandler
+import androidx.core.splashscreen.SplashScreen.Companion.installSplashScreen
+import androidx.compose.animation.animateColorAsState
 import androidx.activity.compose.setContent
 import androidx.compose.foundation.background
 import androidx.compose.foundation.border
@@ -42,6 +44,7 @@ import androidx.compose.material.icons.filled.PlayArrow
 import androidx.compose.material.icons.filled.ScreenRotation
 import androidx.compose.material.icons.filled.Search
 import androidx.compose.material.icons.filled.Settings
+import androidx.compose.material.icons.filled.DeleteOutline
 import androidx.compose.material.icons.filled.Close
 import androidx.compose.material.icons.filled.CheckCircle
 import androidx.compose.material.icons.filled.ErrorOutline
@@ -86,6 +89,7 @@ import dev.aniclipt.app.data.Anime
 import dev.aniclipt.app.data.AnimeRepository
 import dev.aniclipt.app.data.Episode
 import dev.aniclipt.app.data.PlaybackSource
+import kotlinx.coroutines.sync.withPermit
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.delay
 import androidx.activity.compose.rememberLauncherForActivityResult
@@ -99,10 +103,10 @@ import androidx.work.WorkManager
 import java.util.concurrent.TimeUnit
 import java.io.File
 
-private val Ink = Color(0xFFF5F5F7)
-private val Muted = Color(0xFF9A9AA2)
-private val Canvas = Color(0xFF111113)
-private val Panel = Color(0xFF202024)
+private val Ink: Color @Composable get() = MaterialTheme.colorScheme.onSurface
+private val Muted: Color @Composable get() = MaterialTheme.colorScheme.onSurfaceVariant
+private val Canvas: Color @Composable get() = MaterialTheme.colorScheme.background
+private val Panel: Color @Composable get() = MaterialTheme.colorScheme.surface
 private val Accent = Color(0xFF0A84FF)
 
 private enum class ApiKeyValidation { UNKNOWN, EMPTY, CHECKING, VALID, INVALID, UNAVAILABLE }
@@ -151,14 +155,20 @@ class MainActivity : ComponentActivity() {
     private var activityIsResumed = false
 
     override fun onCreate(savedInstanceState: Bundle?) {
+        installSplashScreen()
         super.onCreate(savedInstanceState)
         getSharedPreferences("ani-cli-pt", MODE_PRIVATE).edit()
             .remove("opensubtitles_username")
             .remove("opensubtitles_password")
+            .remove("tmdb_api_key")
             .apply()
         window.statusBarColor = android.graphics.Color.rgb(17, 17, 19)
         window.navigationBarColor = android.graphics.Color.rgb(17, 17, 19)
-        setContent { AniCliTheme { AnimeHome() } }
+        setContent {
+            val prefs = remember { getSharedPreferences("ani-cli-pt", MODE_PRIVATE) }
+            var light by remember { mutableStateOf(prefs.getBoolean("light_theme", false)) }
+            AniCliTheme(light) { AnimeHome(light, { light = it; prefs.edit().putBoolean("light_theme", it).apply() }) }
+        }
         removeInstalledUpdateFile()
     }
 
@@ -258,31 +268,31 @@ class MainActivity : ComponentActivity() {
 }
 
 @Composable
-private fun AniCliTheme(content: @Composable () -> Unit) {
+private fun AniCliTheme(light: Boolean = false, content: @Composable () -> Unit) {
     MaterialTheme(
-        colorScheme = darkColorScheme(
+        colorScheme = if (light) lightColorScheme(primary = Color(0xFF0064C8), onPrimary = Color.White, background = Color(0xFFF5F5F8), surface = Color.White, surfaceVariant = Color(0xFFE9E9EE), onBackground = Color(0xFF18181D), onSurface = Color(0xFF18181D), onSurfaceVariant = Color(0xFF575962)) else darkColorScheme(
             primary = Accent,
             onPrimary = Color.White,
             secondaryContainer = Color(0xFF24384F),
             onSecondaryContainer = Color(0xFFD6E9FF),
-            background = Canvas,
-            surface = Panel,
-            onBackground = Ink,
-            onSurface = Ink,
-            onSurfaceVariant = Muted,
+            background = Color(0xFF111113),
+            surface = Color(0xFF202024),
+            onBackground = Color(0xFFF5F5F7),
+            onSurface = Color(0xFFF5F5F7),
+            onSurfaceVariant = Color(0xFF9A9AA2),
         ),
         content = content,
     )
 }
 
 @Composable
-private fun AnimeHome() {
+private fun AnimeHome(lightTheme: Boolean, onLightTheme: (Boolean) -> Unit) {
     val context = LocalContext.current
     val configuration = LocalConfiguration.current
     val isLandscape = configuration.screenWidthDp > configuration.screenHeightDp
     val focusManager = LocalFocusManager.current
-    val repository = remember { AnimeRepository() }
     val prefs = remember { context.getSharedPreferences("ani-cli-pt", 0) }
+    val repository = remember { AnimeRepository() }
     val scope = rememberCoroutineScope()
     var availableUpdateVersion by remember { mutableStateOf(prefs.getString(ReleaseUpdateWorker.PREF_AVAILABLE_VERSION, null)) }
     var pendingUpdateVersion by remember { mutableStateOf(prefs.getString(ReleaseUpdateWorker.PREF_PENDING_VERSION, null)) }
@@ -312,6 +322,7 @@ private fun AnimeHome() {
     var source by remember { mutableStateOf<PlaybackSource?>(null) }
     var startPositionMs by remember { mutableLongStateOf(0L) }
     var dubbed by remember { mutableStateOf(prefs.getBoolean("default_dubbed", false)) }
+    var videoAspectRatio by remember { mutableStateOf(prefs.getString("video_aspect_ratio", "fit").orEmpty().takeIf { it in setOf("fit", "crop", "stretch") } ?: "fit") }
     var quality by remember { mutableStateOf(prefs.getString("quality", "best") ?: "best") }
     var subtitleSize by remember { mutableStateOf(prefs.getString("subtitle_size", "medium") ?: "medium") }
     var subtitleColor by remember { mutableStateOf(prefs.getString("subtitle_color", "white") ?: "white") }
@@ -326,6 +337,8 @@ private fun AnimeHome() {
     var openSubtitlesEnabled by remember { mutableStateOf(prefs.getBoolean("opensubtitles_enabled", false)) }
     var favoriteView by remember { mutableStateOf(false) }
     var historyView by remember { mutableStateOf(false) }
+    var pendingHistoryRemoval by remember { mutableStateOf<WatchHistoryItem?>(null) }
+    var pendingFavoriteRemoval by remember { mutableStateOf<Anime?>(null) }
     var settingsView by remember { mutableStateOf(false) }
     var notificationsEnabled by remember { mutableStateOf(prefs.getBoolean("episode_notifications", false)) }
     var automaticUpdatesEnabled by remember { mutableStateOf(prefs.getBoolean(ReleaseUpdateWorker.PREF_ENABLED, false)) }
@@ -344,6 +357,8 @@ private fun AnimeHome() {
     var history by remember { mutableStateOf(prefs.getString("history", "") ?: "") }
     var watchHistory by remember { mutableStateOf(loadWatchHistory(prefs)) }
     var searchGeneration by remember { mutableIntStateOf(0) }
+    var catalogJob by remember { mutableStateOf<kotlinx.coroutines.Job?>(null) }
+    val catalogSemaphore = remember { kotlinx.coroutines.sync.Semaphore(4) }
     val notificationPermission = rememberLauncherForActivityResult(ActivityResultContracts.RequestPermission()) { granted ->
         if (!granted) {
             when (pendingNotificationFeature) {
@@ -378,7 +393,7 @@ private fun AnimeHome() {
         FavoriteEpisodeWorker.schedule(context)
     }
 
-    fun toggleFavorite(anime: Anime) {
+    fun applyFavoriteToggle(anime: Anime) {
         val next = favorites.toMutableSet().apply { if (!add(anime.slug)) remove(anime.slug) }
         favorites = next
         prefs.edit().putStringSet("favorites", next).apply()
@@ -388,6 +403,9 @@ private fun AnimeHome() {
         savedAnime.values.forEach { saved -> array.put(org.json.JSONObject().put("slug", saved.slug).put("title", saved.title).put("poster", saved.poster).put("synopsis", saved.synopsis)) }
         prefs.edit().putString("favorite_items", array.toString()).apply()
         if (anime.slug in next && notificationsEnabled) FavoriteEpisodeWorker.captureBaseline(context)
+    }
+    fun toggleFavorite(anime: Anime) {
+        if (anime.slug in favorites) pendingFavoriteRemoval = anime else applyFavoriteToggle(anime)
     }
     fun setAutomaticUpdatesEnabled(enabled: Boolean) {
         automaticUpdatesEnabled = enabled
@@ -429,9 +447,24 @@ private fun AnimeHome() {
             }
         }
     }
+    fun enrichCatalog(items: List<Anime>, generation: Int, isAiring: Boolean = false) {
+        if (!isAiring) catalogJob?.cancel()
+        val parent = scope.launch {
+        items.forEach { anime -> launch {
+            val updated = catalogSemaphore.withPermit { runCatching { repository.catalogSynopsis(anime) }.getOrNull() } ?: return@launch
+            if (isAiring) {
+                airing = airing.map { if (it.slug == updated.slug) it.copy(synopsis = updated.synopsis) else it }
+                if (featured?.slug == updated.slug && featured?.synopsis.isNullOrBlank()) featured = featured?.copy(synopsis = updated.synopsis)
+            }
+            if (generation == searchGeneration) results = results.map { if (it.slug == updated.slug) it.copy(synopsis = updated.synopsis) else it }
+        } }
+        }
+        if (!isAiring) catalogJob = parent
+    }
     fun search(term: String, debounce: Boolean = false) {
         val normalized = term.trim()
         val generation = ++searchGeneration
+        catalogJob?.cancel()
         if (normalized.isEmpty()) {
             results = airing
             error = null
@@ -448,7 +481,8 @@ private fun AnimeHome() {
             val response = runCatching { repository.search(normalized) }
             if (generation != searchGeneration) return@launch
             response.onSuccess { items ->
-                results = items
+                results = items.map { it.copy(synopsis = "") }
+                enrichCatalog(items, generation)
                 if (items.isEmpty()) error = "Nenhum resultado encontrado."
             }.onFailure { failure -> error = "Falha ao buscar o catálogo: ${failure.message ?: "erro de rede"}" }
             busy = false
@@ -497,6 +531,11 @@ private fun AnimeHome() {
         busy = true
         error = null
         scope.launch {
+            launch {
+                runCatching { repository.artwork(season) }.onSuccess { details ->
+                    if (currentSeason?.slug == season.slug) currentSeason = details
+                }
+            }
             runCatching { repository.episodes(season) }
                 .onSuccess { episodes = it; if (it.isEmpty()) error = "Nenhum episódio disponível nesta temporada." }
                 .onFailure { error = it.message ?: "Não foi possível carregar esta temporada." }
@@ -513,8 +552,9 @@ private fun AnimeHome() {
         error = null
         scope.launch {
             launch {
-                if (anime.banner.isBlank()) runCatching { repository.artwork(anime) }.onSuccess { artwork ->
+                runCatching { repository.artwork(anime) }.onSuccess { artwork ->
                     if (selected?.slug == anime.slug) selected = artwork
+                    if (currentSeason?.slug == anime.slug) currentSeason = artwork
                 }
             }
             launch {
@@ -585,10 +625,11 @@ private fun AnimeHome() {
         busy = true
         runCatching { repository.airing() }
             .onSuccess { items ->
-                airing = items
-                results = items
+                airing = items.map { it.copy(synopsis = "") }
+                if (query.isBlank()) results = airing
+                enrichCatalog(items, if (query.isBlank()) searchGeneration else -1, isAiring = true)
                 items.firstOrNull()?.let { first ->
-                    featured = first
+                    featured = first.copy(synopsis = "")
                     runCatching { repository.artwork(first) }.onSuccess { artwork -> featured = artwork }
                 }
             }
@@ -616,13 +657,14 @@ private fun AnimeHome() {
     Box(Modifier.fillMaxSize()) {
     Scaffold(containerColor = Canvas, bottomBar = {
         val navShape = RoundedCornerShape(topStart = 22.dp, topEnd = 22.dp)
+        val navigationColor by animateColorAsState(if (lightTheme) Panel.copy(alpha = .96f) else Color(0xE51C1C1E), label = "navigationColor")
         NavigationBar(
             modifier = Modifier
                 .then(if (isLandscape) Modifier.height(64.dp) else Modifier)
                 .shadow(18.dp, navShape)
                 .clip(navShape)
                 .border(1.dp, Color.White.copy(alpha = 0.10f), navShape),
-            containerColor = Color(0xE51C1C1E),
+            containerColor = navigationColor,
             contentColor = Ink,
             tonalElevation = 0.dp,
         ) {
@@ -638,19 +680,20 @@ private fun AnimeHome() {
                 verticalAlignment = Alignment.CenterVertically,
             ) {
                 Box(Modifier.size(38.dp).clip(RoundedCornerShape(13.dp)).background(Brush.linearGradient(listOf(Color(0xFF303036), Color(0xFF19191C)))), contentAlignment = Alignment.Center) {
-                    Text("あ", fontSize = 20.sp, fontWeight = FontWeight.Bold)
+                    Text("あ", color = Color.White, fontSize = 20.sp, fontWeight = FontWeight.Bold)
                 }
                 Spacer(Modifier.width(10.dp))
                 Text("ani-cli", fontWeight = FontWeight.Bold, fontSize = 18.sp, color = Ink)
                 Text("pt", color = Accent, fontSize = 12.sp, modifier = Modifier.align(Alignment.Top).padding(top = 3.dp))
             }
-            if (!settingsView) Row(Modifier.fillMaxWidth().widthIn(max = 960.dp).align(Alignment.CenterHorizontally).padding(horizontal = 16.dp).clip(RoundedCornerShape(16.dp)).background(Color(0xC8202024)).border(1.dp, Color.White.copy(alpha = 0.07f), RoundedCornerShape(16.dp)).padding(horizontal = 14.dp, vertical = 4.dp), verticalAlignment = Alignment.CenterVertically) {
+            if (!settingsView) Row(Modifier.fillMaxWidth().widthIn(max = 960.dp).align(Alignment.CenterHorizontally).padding(horizontal = 16.dp).clip(RoundedCornerShape(16.dp)).background(if (lightTheme) Panel else Color(0xC8202024)).border(1.dp, Color.White.copy(alpha = 0.07f), RoundedCornerShape(16.dp)).padding(horizontal = 14.dp, vertical = 4.dp), verticalAlignment = Alignment.CenterVertically) {
                 Icon(Icons.Default.Search, null, tint = Muted)
                 TextField(value = query, onValueChange = { query = it; search(it, debounce = true) }, modifier = Modifier.weight(1f), placeholder = { Text("Buscar anime...", color = Muted, maxLines = 1) }, singleLine = true, colors = TextFieldDefaults.colors(focusedContainerColor = Color.Transparent, unfocusedContainerColor = Color.Transparent, focusedIndicatorColor = Color.Transparent, unfocusedIndicatorColor = Color.Transparent), keyboardOptions = KeyboardOptions(imeAction = ImeAction.Search), keyboardActions = KeyboardActions(onSearch = { focusManager.clearFocus(force = true); search(query) }))
-                if (query.isNotEmpty()) IconButton(onClick = { query = ""; search("") }, modifier = Modifier.size(40.dp)) { Icon(Icons.Default.Close, "Limpar pesquisa", tint = Muted) }
+                if (query.isNotEmpty()) IconButton(onClick = { query = ""; search("") }, modifier = Modifier.size(48.dp)) { Icon(Icons.Default.Close, "Limpar pesquisa", tint = Muted) }
             }
             if (settingsView) {
                 SettingsScreen(
+                    lightTheme = lightTheme, onLightTheme = onLightTheme,
                     modifier = Modifier.weight(1f).widthIn(max = 760.dp).align(Alignment.CenterHorizontally),
                     dubbed = dubbed,
                     onDubbed = { dubbed = it; prefs.edit().putBoolean("default_dubbed", it).apply() },
@@ -708,21 +751,46 @@ private fun AnimeHome() {
                     item(key = "loading") { LinearProgressIndicator(Modifier.fillMaxWidth().padding(horizontal = 20.dp), color = Accent) }
                 }
                 error?.let { message ->
-                    item(key = "error") { Text(message, Modifier.padding(horizontal = 20.dp, vertical = 12.dp), color = Color(0xFFFF8A80), fontSize = 13.sp) }
+                    item(key = "error") { Text(message, Modifier.padding(horizontal = 20.dp, vertical = 12.dp), color = if (lightTheme) Color(0xFFB3261E) else Color(0xFFFF8A80), fontSize = 13.sp) }
                 }
                 if (((historyView && watchHistory.isEmpty()) || (!historyView && visibleItems.isEmpty())) && (historyView || !busy) && error == null) {
                     item(key = "empty") { Text(if (favoriteView) "Seus animes favoritos aparecem aqui." else if (historyView) "Os animes que você assistir aparecerão aqui com o tempo reproduzido." else "Busque um título para começar.", Modifier.padding(20.dp), color = Muted) }
                 }
                 items(visibleItems, key = { it.slug }) { anime ->
-                    AnimeRow(anime, anime.slug in favorites, onClick = { openAnime(anime) }, onFavorite = { toggleFavorite(anime) })
+                    Box(Modifier.animateItem()) { AnimeRow(anime, anime.slug in favorites, onClick = { openAnime(anime) }, onFavorite = { toggleFavorite(anime) }) }
                 }
                 if (historyView) {
                     items(watchHistory, key = { "watch-${it.anime.slug}" }) { entry ->
-                        WatchHistoryRow(entry, onClick = { resumeHistory(entry) })
+                        Box(Modifier.animateItem()) { WatchHistoryRow(entry, onClick = { resumeHistory(entry) }, onRemove = { pendingHistoryRemoval = entry }) }
                     }
                 }
             }
         }
+    }
+
+    pendingFavoriteRemoval?.let { anime ->
+        AlertDialog(onDismissRequest = { pendingFavoriteRemoval = null }, title = { Text("Remover dos favoritos?") }, text = { Text("${anime.title} será removido dos favoritos.") }, confirmButton = { TextButton(onClick = { applyFavoriteToggle(anime); pendingFavoriteRemoval = null }) { Text("Remover") } }, dismissButton = { TextButton(onClick = { pendingFavoriteRemoval = null }) { Text("Cancelar") } })
+    }
+
+    pendingHistoryRemoval?.let { entry ->
+        AlertDialog(
+            onDismissRequest = { pendingHistoryRemoval = null },
+            title = { Text("Remover do histórico?") },
+            text = { Text("O progresso e os episódios vistos de ${entry.anime.title} serão removidos deste aparelho.") },
+            confirmButton = { TextButton(onClick = {
+                watchHistory = watchHistory.filterNot { it.anime.slug == entry.anime.slug }
+                val saved = runCatching { org.json.JSONArray(prefs.getString("watch_history", "[]")) }.getOrDefault(org.json.JSONArray())
+                val remaining = org.json.JSONArray()
+                for (index in 0 until saved.length()) {
+                    val item = saved.optJSONObject(index) ?: continue
+                    if (item.optString("slug") != entry.anime.slug) remaining.put(item)
+                }
+                history = history.split(',').filter { it.isNotBlank() && !it.startsWith("${entry.anime.slug}:") }.joinToString(",")
+                prefs.edit().putString("watch_history", remaining.toString()).putString("history", history).apply()
+                pendingHistoryRemoval = null
+            }) { Text("Remover") } },
+            dismissButton = { TextButton(onClick = { pendingHistoryRemoval = null }) { Text("Cancelar") } },
+        )
     }
 
     if (selected != null && source == null) {
@@ -733,15 +801,15 @@ private fun AnimeHome() {
         val playingAnime = currentSeason ?: selected
         val historyAnime = playingAnime?.copy(poster = playingAnime.poster.ifBlank { selected?.poster.orEmpty() })
         val playingEpisode = chosenEpisode
-        NativePlayer(
+        AniCliTheme { NativePlayer(
             source = source!!,
             anime = historyAnime,
             episode = playingEpisode,
             startPositionMs = startPositionMs,
             quality = quality,
             onQuality = { quality = it; prefs.edit().putString("quality", it).apply() },
-            aspectRatio = prefs.getString("video_aspect_ratio", "fit") ?: "fit",
-            onAspectRatio = { prefs.edit().putString("video_aspect_ratio", it).apply() },
+            aspectRatio = videoAspectRatio,
+            onAspectRatio = { videoAspectRatio = it; prefs.edit().putString("video_aspect_ratio", it).apply() },
             onWatchProgress = { seconds, position, duration, completed ->
                 if (historyAnime != null && playingEpisode != null) recordWatchProgress(historyAnime, playingEpisode, seconds, position, duration, completed)
             },
@@ -754,7 +822,7 @@ private fun AnimeHome() {
             subtitleOutlineThickness = subtitleOutlineThickness,
             subtitlePosition = subtitlePosition,
             modifier = Modifier.fillMaxSize(),
-        )
+        ) }
     }
     }
 }
@@ -797,12 +865,12 @@ private fun AnimeRow(anime: Anime, favorite: Boolean, onClick: () -> Unit, onFav
                 }
             }
         }
-        IconButton(onClick = onFavorite) { Icon(if (favorite) Icons.Default.Favorite else Icons.Default.FavoriteBorder, "Favoritar", tint = if (favorite) Color(0xFFFF6B82) else Muted) }
+        IconButton(onClick = onFavorite) { Icon(if (favorite) Icons.Default.Favorite else Icons.Default.FavoriteBorder, if (favorite) "Remover ${anime.title} dos favoritos" else "Adicionar ${anime.title} aos favoritos", tint = if (favorite) Color(0xFFFF6B82) else Muted) }
     }
 }
 
 @Composable
-private fun WatchHistoryRow(item: WatchHistoryItem, onClick: () -> Unit) {
+private fun WatchHistoryRow(item: WatchHistoryItem, onClick: () -> Unit, onRemove: () -> Unit) {
     val compact = LocalConfiguration.current.screenWidthDp < 380
     Row(
         Modifier.fillMaxWidth().clickable(onClick = onClick)
@@ -823,16 +891,18 @@ private fun WatchHistoryRow(item: WatchHistoryItem, onClick: () -> Unit) {
                 HistoryStat("$episodesStarted ${if (episodesStarted == 1) "episódio" else "episódios"}")
                 HistoryStat(formatWatchedTime(item.secondsWatched))
             }
-            Text(item.lastEpisode.ifBlank { "Retomar reprodução" }, color = Color(0xFFB9D9FF), fontSize = 11.sp, maxLines = 1, modifier = Modifier.padding(top = 6.dp))
+            Text(item.lastEpisode.ifBlank { "Retomar reprodução" }, color = if (Canvas == Color(0xFF111113)) Color(0xFFB9D9FF) else MaterialTheme.colorScheme.primary, fontSize = 11.sp, maxLines = 1, modifier = Modifier.padding(top = 6.dp))
             if (item.episodeDurationMs > 0L) {
                 val progress = (item.resumePositionMs.toFloat() / item.episodeDurationMs).coerceIn(0f, 1f)
-                Box(Modifier.fillMaxWidth().padding(top = 5.dp).height(3.dp).clip(RoundedCornerShape(2.dp)).background(Color.White.copy(.12f))) {
+                Box(Modifier.fillMaxWidth().padding(top = 5.dp).height(3.dp).clip(RoundedCornerShape(2.dp)).background(Ink.copy(.12f))) {
                     Box(Modifier.fillMaxWidth(progress).fillMaxHeight().background(Accent))
                 }
                 Text("Retomar em ${formatPlaybackTime(item.resumePositionMs)} / ${formatPlaybackTime(item.episodeDurationMs)}", color = Muted, fontSize = 10.sp, maxLines = 1, modifier = Modifier.padding(top = 4.dp))
             } else Text("Toque para continuar do último episódio", color = Muted, fontSize = 10.sp, maxLines = 1, modifier = Modifier.padding(top = 4.dp))
         }
-        Icon(Icons.Default.PlayArrow, "Abrir episódios", tint = Color(0xFFB9D9FF))
+        IconButton(onClick = onRemove) {
+            Icon(Icons.Default.DeleteOutline, "Remover ${item.anime.title} do histórico", tint = Muted)
+        }
     }
 }
 
@@ -864,6 +934,7 @@ private fun Tag(text: String) {
 
 @Composable
 private fun SettingsScreen(
+    lightTheme: Boolean, onLightTheme: (Boolean) -> Unit,
     modifier: Modifier = Modifier,
     dubbed: Boolean,
     onDubbed: (Boolean) -> Unit,
@@ -900,33 +971,37 @@ private fun SettingsScreen(
     Column(modifier.fillMaxWidth().verticalScroll(rememberScrollState()).padding(horizontal = 18.dp, vertical = 12.dp)) {
         Text("PREFERÊNCIAS", color = Muted, fontSize = 10.sp, fontWeight = FontWeight.Bold, letterSpacing = 1.5.sp)
         Text("Configurações", fontSize = 28.sp, fontWeight = FontWeight.Bold, modifier = Modifier.padding(bottom = 18.dp))
+        Row(Modifier.fillMaxWidth().padding(bottom = 16.dp).clip(RoundedCornerShape(18.dp)).background(Panel).padding(horizontal = 16.dp, vertical = 8.dp), verticalAlignment = Alignment.CenterVertically) {
+            Column(Modifier.weight(1f)) { Text("Modo claro", fontWeight = FontWeight.SemiBold); Text("Altere a aparência do aplicativo", color = Muted, fontSize = 11.sp) }
+            Switch(checked = lightTheme, onCheckedChange = onLightTheme)
+        }
         Text("REPRODUÇÃO", color = Muted, fontSize = 10.sp, fontWeight = FontWeight.Bold, letterSpacing = 1.3.sp, modifier = Modifier.padding(start = 4.dp, bottom = 8.dp))
-        Column(Modifier.fillMaxWidth().clip(RoundedCornerShape(18.dp)).background(Color(0xB8202024)).border(1.dp, Color.White.copy(.08f), RoundedCornerShape(18.dp)).padding(horizontal = 16.dp)) {
+        Column(Modifier.fillMaxWidth().clip(RoundedCornerShape(18.dp)).background(if (lightTheme) Panel else Color(0xB8202024)).border(1.dp, Color.White.copy(.08f), RoundedCornerShape(18.dp)).padding(horizontal = 16.dp)) {
             Row(Modifier.fillMaxWidth().padding(vertical = 12.dp), verticalAlignment = Alignment.CenterVertically) {
                 Column(Modifier.weight(1f).padding(end = 10.dp)) { Text("Preferir dublagem PT-BR", fontWeight = FontWeight.SemiBold, fontSize = 14.sp); Text("Sem faixa PT-BR identificada: usa áudio original", color = Muted, fontSize = 11.sp, modifier = Modifier.padding(top = 3.dp)) }
                 Switch(checked = dubbed, onCheckedChange = onDubbed)
             }
         }
         Text("APARÊNCIA DAS LEGENDAS", color = Muted, fontSize = 10.sp, fontWeight = FontWeight.Bold, letterSpacing = 1.3.sp, modifier = Modifier.padding(start = 4.dp, top = 22.dp, bottom = 8.dp))
-        Column(Modifier.fillMaxWidth().clip(RoundedCornerShape(18.dp)).background(Color(0xB8202024)).border(1.dp, Color.White.copy(.08f), RoundedCornerShape(18.dp)).padding(horizontal = 16.dp)) {
+        Column(Modifier.fillMaxWidth().clip(RoundedCornerShape(18.dp)).background(if (lightTheme) Panel else Color(0xB8202024)).border(1.dp, Color.White.copy(.08f), RoundedCornerShape(18.dp)).padding(horizontal = 16.dp)) {
             SubtitlePreview(subtitleSize, subtitleColor, subtitleFont, subtitleBackground, subtitleOutlineColor, subtitleOutlineThickness, subtitlePosition)
-            HorizontalDivider(color = Color.White.copy(.08f))
+            HorizontalDivider(color = Ink.copy(.10f))
             SubtitlePreferenceRow("Tamanho", subtitleSize, listOf("small" to "Pequeno", "medium" to "Médio", "large" to "Grande"), onSubtitleSize)
-            HorizontalDivider(color = Color.White.copy(.08f))
+            HorizontalDivider(color = Ink.copy(.10f))
             SubtitlePreferenceRow("Cor do texto", subtitleColor, listOf("white" to "Branco", "yellow" to "Amarelo", "cyan" to "Ciano", "green" to "Verde"), onSubtitleColor)
-            HorizontalDivider(color = Color.White.copy(.08f))
+            HorizontalDivider(color = Ink.copy(.10f))
             SubtitlePreferenceRow("Tipo de letra", subtitleFont, listOf("sans" to "Sem serifa", "serif" to "Serifada", "mono" to "Monoespaçada"), onSubtitleFont)
-            HorizontalDivider(color = Color.White.copy(.08f))
+            HorizontalDivider(color = Ink.copy(.10f))
             SubtitlePreferenceRow("Fundo", subtitleBackground, listOf("none" to "Sem fundo", "translucent" to "Translúcido", "dark" to "Escuro"), onSubtitleBackground)
-            HorizontalDivider(color = Color.White.copy(.08f))
+            HorizontalDivider(color = Ink.copy(.10f))
             SubtitlePreferenceRow("Cor da borda", subtitleOutlineColor, listOf("black" to "Preta", "white" to "Branca", "blue" to "Azul", "yellow" to "Amarela", "red" to "Vermelha"), onSubtitleOutlineColor)
-            HorizontalDivider(color = Color.White.copy(.08f))
+            HorizontalDivider(color = Ink.copy(.10f))
             SubtitlePreferenceRow("Espessura da borda", subtitleOutlineThickness, listOf("none" to "Sem borda", "thin" to "Fina", "medium" to "Média", "thick" to "Grossa"), onSubtitleOutlineThickness)
-            HorizontalDivider(color = Color.White.copy(.08f))
+            HorizontalDivider(color = Ink.copy(.10f))
             SubtitlePreferenceRow("Posição na tela", subtitlePosition, listOf("top" to "Superior", "center" to "Centro", "bottom" to "Inferior"), onSubtitlePosition)
         }
         Text("BUSCA DE LEGENDAS PT-BR", color = Muted, fontSize = 10.sp, fontWeight = FontWeight.Bold, letterSpacing = 1.3.sp, modifier = Modifier.padding(start = 4.dp, top = 22.dp, bottom = 8.dp))
-        Column(Modifier.fillMaxWidth().clip(RoundedCornerShape(18.dp)).background(Color(0xB8202024)).border(1.dp, Color.White.copy(.08f), RoundedCornerShape(18.dp)).padding(16.dp)) {
+        Column(Modifier.fillMaxWidth().clip(RoundedCornerShape(18.dp)).background(if (lightTheme) Panel else Color(0xB8202024)).border(1.dp, Color.White.copy(.08f), RoundedCornerShape(18.dp)).padding(16.dp)) {
             Text("OpenSubtitles", fontWeight = FontWeight.SemiBold, fontSize = 14.sp)
             Text("Ative para buscar legendas PT-BR externas quando a fonte do vídeo não tiver uma. Desativado, o app não consulta o OpenSubtitles.", color = Muted, fontSize = 11.sp, modifier = Modifier.padding(top = 4.dp, bottom = 8.dp))
             Row(Modifier.fillMaxWidth().padding(vertical = 6.dp), verticalAlignment = Alignment.CenterVertically) {
@@ -958,7 +1033,7 @@ private fun SettingsScreen(
                         }
                     }
                 },
-                colors = OutlinedTextFieldDefaults.colors(focusedTextColor = Ink, unfocusedTextColor = Ink, focusedBorderColor = Accent, unfocusedBorderColor = Color.White.copy(.18f), focusedLabelColor = Accent, unfocusedLabelColor = Muted, cursorColor = Accent),
+                colors = OutlinedTextFieldDefaults.colors(focusedTextColor = Ink, unfocusedTextColor = Ink, focusedBorderColor = Accent, unfocusedBorderColor = Ink.copy(.28f), focusedLabelColor = Accent, unfocusedLabelColor = Muted, cursorColor = Accent),
             )
             val validationMessage = when (apiKeyValidation) {
                 ApiKeyValidation.VALID -> "Chave validada com sucesso."
@@ -976,23 +1051,23 @@ private fun SettingsScreen(
             Text("A chave só é usada quando esta opção está ativada. Sem chave, a busca externa não funciona.", color = Muted, fontSize = 10.sp, modifier = Modifier.padding(top = 6.dp))
         }
         Text("NOTIFICAÇÕES", color = Muted, fontSize = 10.sp, fontWeight = FontWeight.Bold, letterSpacing = 1.3.sp, modifier = Modifier.padding(start = 4.dp, top = 22.dp, bottom = 8.dp))
-        Column(Modifier.fillMaxWidth().clip(RoundedCornerShape(18.dp)).background(Color(0xB8202024)).border(1.dp, Color.White.copy(.08f), RoundedCornerShape(18.dp)).padding(16.dp)) {
+        Column(Modifier.fillMaxWidth().clip(RoundedCornerShape(18.dp)).background(if (lightTheme) Panel else Color(0xB8202024)).border(1.dp, Color.White.copy(.08f), RoundedCornerShape(18.dp)).padding(16.dp)) {
             Row(verticalAlignment = Alignment.CenterVertically) {
                 Column(Modifier.weight(1f).padding(end = 10.dp)) { Text("Novos episódios", fontWeight = FontWeight.SemiBold, fontSize = 14.sp); Text("Avisar quando sair episódio de um anime favorito. Verificação periódica, em geral a cada 6 horas.", color = Muted, fontSize = 11.sp, modifier = Modifier.padding(top = 4.dp)) }
                 Switch(checked = notificationsEnabled, onCheckedChange = onNotifications)
             }
         }
         Text("ATUALIZAÇÕES", color = Muted, fontSize = 10.sp, fontWeight = FontWeight.Bold, letterSpacing = 1.3.sp, modifier = Modifier.padding(start = 4.dp, top = 22.dp, bottom = 8.dp))
-        Column(Modifier.fillMaxWidth().clip(RoundedCornerShape(18.dp)).background(Color(0xB8202024)).border(1.dp, Color.White.copy(.08f), RoundedCornerShape(18.dp)).padding(16.dp)) {
+        Column(Modifier.fillMaxWidth().clip(RoundedCornerShape(18.dp)).background(if (lightTheme) Panel else Color(0xB8202024)).border(1.dp, Color.White.copy(.08f), RoundedCornerShape(18.dp)).padding(16.dp)) {
             Row(verticalAlignment = Alignment.CenterVertically) {
                 Column(Modifier.weight(1f).padding(end = 10.dp)) {
                     Text("Atualizações automáticas", fontWeight = FontWeight.SemiBold, fontSize = 14.sp)
                     Text("O app sempre verifica ao abrir. Ative para também verificar e baixar em segundo plano. Se houver novidade, você pode baixar por aqui.", color = Muted, fontSize = 11.sp, modifier = Modifier.padding(top = 4.dp))
                     if (availableUpdateVersion != null) {
-                        Text("Nova versão $availableUpdateVersion disponível.", color = Color(0xFF8FC5FF), fontSize = 12.sp, fontWeight = FontWeight.SemiBold, modifier = Modifier.padding(top = 8.dp))
+                        Text("Nova versão $availableUpdateVersion disponível.", color = if (lightTheme) MaterialTheme.colorScheme.primary else Color(0xFF8FC5FF), fontSize = 12.sp, fontWeight = FontWeight.SemiBold, modifier = Modifier.padding(top = 8.dp))
                     }
                     if (pendingUpdateVersion != null) {
-                        Text("Versão $pendingUpdateVersion pronta para instalar.", color = Color(0xFF8FC5FF), fontSize = 12.sp, fontWeight = FontWeight.SemiBold, modifier = Modifier.padding(top = 8.dp))
+                        Text("Versão $pendingUpdateVersion pronta para instalar.", color = if (lightTheme) MaterialTheme.colorScheme.primary else Color(0xFF8FC5FF), fontSize = 12.sp, fontWeight = FontWeight.SemiBold, modifier = Modifier.padding(top = 8.dp))
                     } else when (updateDownloadStatus) {
                         ReleaseUpdateWorker.STATUS_DOWNLOADING -> Text("Baixando atualização…", color = Muted, fontSize = 11.sp, modifier = Modifier.padding(top = 8.dp))
                         ReleaseUpdateWorker.STATUS_FAILED -> Text("Não foi possível baixar. Tente novamente.", color = Color(0xFFFF9B9B), fontSize = 11.sp, modifier = Modifier.padding(top = 8.dp))
@@ -1016,7 +1091,7 @@ private fun SettingsScreen(
                 }
             }
         }
-        Text("ani-cli-pt · 0.1.6", color = Muted, fontSize = 11.sp, modifier = Modifier.align(Alignment.CenterHorizontally).padding(vertical = 24.dp))
+        Text("ani-cli-pt · 0.1.7", color = Muted, fontSize = 11.sp, modifier = Modifier.align(Alignment.CenterHorizontally).padding(vertical = 24.dp))
     }
 }
 
@@ -1027,7 +1102,7 @@ private fun SubtitlePreferenceRow(title: String, selected: String, options: List
         Text(title, modifier = Modifier.weight(1f), fontWeight = FontWeight.SemiBold, fontSize = 14.sp)
         Box {
             TextButton(onClick = { expanded = true }) {
-                Text(options.firstOrNull { it.first == selected }?.second ?: options.first().second, color = Color(0xFFB9D9FF), fontSize = 12.sp, maxLines = 1)
+                Text(options.firstOrNull { it.first == selected }?.second ?: options.first().second, color = if (Canvas == Color(0xFF111113)) Color(0xFFB9D9FF) else MaterialTheme.colorScheme.primary, fontSize = 12.sp, maxLines = 1)
             }
             DropdownMenu(expanded = expanded, onDismissRequest = { expanded = false }) {
                 options.forEach { (value, label) ->
@@ -1111,26 +1186,31 @@ private fun EpisodeSheet(anime: Anime, episodes: List<Episode>, watched: Set<Str
     val configuration = LocalConfiguration.current
     val landscape = configuration.screenWidthDp > configuration.screenHeightDp
     val compact = configuration.screenWidthDp < 360
-    ModalBottomSheet(sheetState = sheetState, onDismissRequest = onClose, containerColor = Color(0xFF202024), contentColor = Ink, dragHandle = { BottomSheetDefaults.DragHandle(color = Muted) }) {
+    ModalBottomSheet(sheetState = sheetState, onDismissRequest = onClose, containerColor = Panel, contentColor = Ink, dragHandle = { BottomSheetDefaults.DragHandle(color = Muted) }) {
         Column(Modifier.fillMaxHeight(if (landscape) .98f else .92f).padding(horizontal = if (compact) 12.dp else 18.dp)) {
-            Row(verticalAlignment = Alignment.CenterVertically) {
-                AsyncImage(model = anime.poster, contentDescription = anime.title, modifier = Modifier.size(if (landscape) 54.dp else 76.dp, if (landscape) 72.dp else 100.dp).clip(RoundedCornerShape(12.dp)), contentScale = ContentScale.Crop)
-                Column(Modifier.weight(1f).padding(horizontal = 14.dp)) {
-                    Text("ANI-CLI-PT  /  ANIME", color = Accent, fontSize = 9.sp, fontWeight = FontWeight.Bold, letterSpacing = 1.3.sp)
-                    Text(anime.title, fontWeight = FontWeight.Bold, fontSize = if (landscape) 16.sp else 20.sp, maxLines = if (landscape) 1 else 2)
-                    Text(anime.metadata.joinToString(" · "), color = Muted, fontSize = 11.sp)
-                    Text(anime.synopsis.ifBlank { "Sinopse não disponível." }, color = Color(0xFFB8B8C0), fontSize = 11.sp, maxLines = if (landscape) 1 else 3, modifier = Modifier.padding(top = 6.dp))
+            Row(Modifier.fillMaxWidth().padding(bottom = 12.dp), verticalAlignment = Alignment.Top) {
+                AsyncImage(model = anime.poster, contentDescription = "Capa de ${anime.title}", modifier = Modifier.width(if (landscape) 72.dp else if (compact) 100.dp else 116.dp).height(if (landscape) 96.dp else if (compact) 140.dp else 160.dp).clip(RoundedCornerShape(16.dp)), contentScale = ContentScale.Crop)
+                Column(Modifier.weight(1f).padding(start = 16.dp, end = 4.dp)) {
+                    Text("ANIME", color = MaterialTheme.colorScheme.primary, fontSize = 10.sp, fontWeight = FontWeight.Bold, letterSpacing = 1.2.sp)
+                    Text(anime.title, fontWeight = FontWeight.Bold, fontSize = if (landscape) 18.sp else 22.sp, lineHeight = if (landscape) 22.sp else 27.sp, maxLines = 3, modifier = Modifier.padding(top = 4.dp))
+                    if (anime.metadata.isNotEmpty()) Text(anime.metadata.joinToString(" · "), color = Muted, fontSize = 12.sp, maxLines = 2, modifier = Modifier.padding(top = 7.dp))
+                    IconButton(onClick = onFavorite) { Icon(if (favoriteSlug in favorites) Icons.Default.Favorite else Icons.Default.FavoriteBorder, if (favoriteSlug in favorites) "Remover dos favoritos" else "Adicionar aos favoritos", tint = if (favoriteSlug in favorites) Color(0xFFE24F70) else Muted) }
                 }
-                IconButton(onClick = onFavorite) { Icon(if (favoriteSlug in favorites) Icons.Default.Favorite else Icons.Default.FavoriteBorder, "Favoritar", tint = if (favoriteSlug in favorites) Color(0xFFFF6B82) else Muted) }
             }
-            HorizontalDivider(Modifier.padding(vertical = 14.dp), color = Color(0xFF38383D))
+            var synopsisExpanded by remember(anime.slug) { mutableStateOf(false) }
+            if (anime.synopsis.isNotBlank()) {
+                Text("Sinopse", fontWeight = FontWeight.SemiBold, fontSize = 14.sp)
+                Text(anime.synopsis, color = Muted, fontSize = 13.sp, lineHeight = 19.sp, maxLines = if (synopsisExpanded) 12 else if (landscape) 2 else 3, modifier = Modifier.fillMaxWidth().clickable { synopsisExpanded = !synopsisExpanded }.padding(top = 5.dp))
+                if (anime.synopsis.length > 140) TextButton(onClick = { synopsisExpanded = !synopsisExpanded }, contentPadding = PaddingValues(0.dp), modifier = Modifier.height(36.dp)) { Text(if (synopsisExpanded) "Mostrar menos" else "Ler sinopse", fontSize = 12.sp) }
+            }
+            HorizontalDivider(Modifier.padding(vertical = 10.dp), color = Muted.copy(.22f))
             Row(verticalAlignment = Alignment.CenterVertically) {
                 Column(Modifier.weight(1f)) { Text("GUIA DE EPISÓDIOS", color = Muted, fontSize = 9.sp, fontWeight = FontWeight.Bold, letterSpacing = 1.3.sp); Text("Escolha onde começar", fontWeight = FontWeight.SemiBold, fontSize = 17.sp) }
                 if (seasons.size > 1) {
                     Box {
                         Column(horizontalAlignment = Alignment.End) {
                             TextButton(onClick = { seasonExpanded = true }, contentPadding = PaddingValues(horizontal = 6.dp, vertical = 0.dp)) {
-                                Text(seasonLabel(anime, seasons), color = Color(0xFFB9D9FF), fontSize = 11.sp, maxLines = 1)
+                                Text(seasonLabel(anime, seasons), color = if (Canvas == Color(0xFF111113)) Color(0xFFB9D9FF) else MaterialTheme.colorScheme.primary, fontSize = 11.sp, maxLines = 1)
                             }
                             Text("${episodes.size} episódios", color = Muted, fontSize = 10.sp)
                         }
@@ -1167,13 +1247,13 @@ private fun EpisodeSheet(anime: Anime, episodes: List<Episode>, watched: Set<Str
                     val hasWatched = "${anime.slug}:${episode.number}" in watched
                     val rowShape = RoundedCornerShape(13.dp)
                     Row(Modifier.fillMaxWidth().padding(vertical = 3.dp).clip(rowShape)
-                        .background(if (hasWatched) Color(0xFF20382F) else Color(0xFF29292E))
+                        .background(if (Canvas == Color(0xFF111113)) { if (hasWatched) Color(0xFF20382F) else Color(0xFF29292E) } else { if (hasWatched) Color(0xFFD6EDDE) else Color(0xFFE9E9EE) })
                         .border(if (isSelected) 1.dp else 0.dp, if (isSelected) Color(0xFF5598E8) else Color.Transparent, rowShape)
                         .clickable { picked = episode }.padding(horizontal = 10.dp, vertical = 9.dp), verticalAlignment = Alignment.CenterVertically) {
-                        Text(episode.number.padStart(2, '0'), modifier = Modifier.clip(RoundedCornerShape(9.dp)).background(if (hasWatched) Color(0xFF28513F) else if (isSelected) Color(0xFF153451) else Color(0xFF38383D)).padding(horizontal = 10.dp, vertical = 8.dp), color = if (hasWatched) Color(0xFF9CE0B9) else if (isSelected) Color(0xFFB9D9FF) else Muted, fontWeight = FontWeight.Bold, fontSize = 11.sp)
+                        Text(episode.number.padStart(2, '0'), modifier = Modifier.clip(RoundedCornerShape(9.dp)).background(if (Canvas == Color(0xFF111113)) { if (hasWatched) Color(0xFF28513F) else if (isSelected) Color(0xFF153451) else Color(0xFF38383D) } else { if (hasWatched) Color(0xFFB9DCC4) else if (isSelected) Color(0xFFD0E6FF) else Color.White }).padding(horizontal = 10.dp, vertical = 8.dp), color = if (Canvas == Color(0xFF111113)) { if (hasWatched) Color(0xFF9CE0B9) else if (isSelected) Color(0xFFB9D9FF) else Muted } else { if (hasWatched) Color(0xFF1C5933) else if (isSelected) Color(0xFF004C97) else Muted }, fontWeight = FontWeight.Bold, fontSize = 11.sp)
                         Column(Modifier.weight(1f).padding(horizontal = 10.dp)) {
-                            Text("Episódio ${episode.number}", fontWeight = FontWeight.SemiBold, fontSize = 12.sp)
-                            if (episode.title != "Episódio ${episode.number}") Text(episode.title, color = Muted, fontSize = 10.sp, maxLines = 1)
+                            Text("Episódio ${episode.number}", fontWeight = FontWeight.SemiBold, fontSize = 14.sp)
+                            if (episode.title != "Episódio ${episode.number}") Text(episode.title, color = Muted, fontSize = 12.sp, maxLines = 2)
                         }
                         Button(onClick = { onPlay(episode) }, enabled = !busy, shape = RoundedCornerShape(12.dp), contentPadding = PaddingValues(horizontal = 10.dp, vertical = 8.dp), modifier = Modifier.widthIn(min = 80.dp)) { Icon(Icons.Default.PlayArrow, null, modifier = Modifier.size(17.dp)); Spacer(Modifier.width(2.dp)); Text("Assistir", fontSize = 10.sp, maxLines = 1) }
                     }
@@ -1183,6 +1263,7 @@ private fun EpisodeSheet(anime: Anime, episodes: List<Episode>, watched: Set<Str
     }
 }
 
+@androidx.annotation.OptIn(androidx.media3.common.util.UnstableApi::class)
 @Composable
 private fun NativePlayer(source: PlaybackSource, anime: Anime?, episode: Episode?, startPositionMs: Long, quality: String, onQuality: (String) -> Unit, aspectRatio: String, onAspectRatio: (String) -> Unit, onWatchProgress: (Long, Long, Long, Boolean) -> Unit, onClose: () -> Unit, subtitleSize: String, subtitleColor: String, subtitleFont: String, subtitleBackground: String, subtitleOutlineColor: String, subtitleOutlineThickness: String, subtitlePosition: String, modifier: Modifier = Modifier) {
     val context = LocalContext.current
@@ -1354,7 +1435,7 @@ private fun NativePlayer(source: PlaybackSource, anime: Anime?, episode: Episode
                 ) {
                     Box {
                         TextButton(onClick = { qualityMenuExpanded = true }, contentPadding = PaddingValues(horizontal = 8.dp)) {
-                            Text("${qualityLabel(quality)} ▾", color = Color(0xFFB9D9FF), fontSize = 11.sp, maxLines = 1)
+                            Text("${qualityLabel(quality)} ▾", color = if (Canvas == Color(0xFF111113)) Color(0xFFB9D9FF) else MaterialTheme.colorScheme.primary, fontSize = 11.sp, maxLines = 1)
                         }
                         DropdownMenu(expanded = qualityMenuExpanded, onDismissRequest = { qualityMenuExpanded = false }) {
                             DropdownMenuItem(text = { Text("Automática") }, onClick = { onQuality("best"); qualityMenuExpanded = false })
@@ -1403,6 +1484,7 @@ private fun aspectRatioLabel(value: String): String = when (value) {
     else -> "Ajustar"
 }
 
+@androidx.annotation.OptIn(androidx.media3.common.util.UnstableApi::class)
 private fun videoResizeMode(aspectRatio: String): Int = when (aspectRatio) {
         "crop" -> androidx.media3.ui.AspectRatioFrameLayout.RESIZE_MODE_ZOOM
         "stretch" -> androidx.media3.ui.AspectRatioFrameLayout.RESIZE_MODE_FILL
