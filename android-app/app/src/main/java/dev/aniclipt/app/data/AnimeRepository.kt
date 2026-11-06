@@ -35,13 +35,16 @@ class DubSuggestion(val dubbed: PlaybackSource, val english: PlaybackSource?) : 
 
 class AnimeRepository {
     private val hi = HiAnimeRepository()
+    private val airingCache = TimedRequestCache<String, List<Anime>>(maxEntries = 1, ttlMillis = 10 * 60_000L, shouldCache = { it.isNotEmpty() })
+    private val episodeCache = TimedRequestCache<String, List<Episode>>(maxEntries = 24, ttlMillis = 15 * 60_000L, shouldCache = { it.isNotEmpty() })
+    private val seasonsCache = TimedRequestCache<String, List<Anime>>(maxEntries = 24, ttlMillis = 30 * 60_000L, shouldCache = { it.isNotEmpty() })
     private val fireDetailsCache = TimedRequestCache<String, String>(maxEntries = 128, ttlMillis = 5 * 60_000L)
     private val seasonPosterCache = TimedRequestCache<String, String>(maxEntries = 128, ttlMillis = 30 * 60_000L, shouldCache = { it.isNotBlank() })
     private val searchCache = TimedRequestCache<String, List<Anime>>(maxEntries = 32, ttlMillis = 2 * 60_000L, shouldCache = { it.isNotEmpty() })
     private data class ArtworkFields(val poster: String, val banner: String, val synopsis: String, val isAdult: Boolean?, val availability: Availability)
     private val artworkCache = TimedRequestCache<String, ArtworkFields>(maxEntries = 128, ttlMillis = 30 * 60_000L, shouldCache = { it.synopsis.isNotBlank() })
-    suspend fun airing(): List<Anime> = withContext(Dispatchers.IO) {
-        fireCatalog("$FIRE_BASE/animes?v=3")
+    suspend fun airing(): List<Anime> = airingCache.getOrLoad("airing") {
+        withContext(Dispatchers.IO) { fireCatalog("$FIRE_BASE/animes?v=3") }
     }
 
     suspend fun search(query: String): List<Anime> = searchCache.getOrLoad(query.trim().lowercase(java.util.Locale.ROOT)) { searchUncached(query) }
@@ -59,7 +62,14 @@ class AnimeRepository {
             listOf("AnimeFire", "AnimesDigital", "AnimeDrive", "Goyabu", "HiAnime").map { name -> async { runCatching { fetchSource(name) }.getOrDefault(emptyList()) } }.awaitAll().flatten()
         }.toMutableList()
         val identities = runCatching { aniListSearch(query) }.getOrDefault(emptyList())
-        val relatedQueries = identities.take(3).mapNotNull { it.romaji.takeIf(String::isNotBlank) }.distinct().filterNot { normalizeMatchText(it) == normalizeMatchText(query) }.take(2)
+        val normalizedQuery = normalizeMatchText(query)
+        val knownAliases = hi.searchAliases(query)
+        val relatedQueries = if (!needsRelatedTitleSearch(query, results)) emptyList() else identities.take(3)
+            .mapNotNull { it.romaji.takeIf(String::isNotBlank) }
+            .distinct()
+            .filterNot { normalizeMatchText(it) == normalizedQuery }
+            .ifEmpty { knownAliases }
+            .take(2)
         results += coroutineScope { relatedQueries.map { alias -> async { runCatching { digitalSearch(alias) }.getOrDefault(emptyList()) } }.awaitAll().flatten() }
         val identified = results.distinctBy { it.slug }.map { item ->
             val matched = identities.mapNotNull { identity -> identityScore(item.title, identity.format, identity.titles, explicitFormat(item.title, item.metadata))?.let { identity to it } }.sortedByDescending { it.second }
@@ -78,7 +88,7 @@ class AnimeRepository {
             preferred.copy(alternatives = group.filterNot { it.slug == preferred.slug }, isAdult = aggregateAdultFlags(group))
         }
         val queryIds = identities.filter { identityScore(query, it.format, it.titles) != null }.map { it.id }.toSet()
-        filterRelevantResults(grouped, query, queryIds)
+        filterRelevantResults(grouped, query, queryIds, relatedQueries)
     }
 
     suspend fun validateOpenSubtitlesApiKey(apiKey: String): Boolean? = withContext(Dispatchers.IO) {
@@ -103,7 +113,12 @@ class AnimeRepository {
         }
     }
 
-    suspend fun episodes(anime: Anime): List<Episode> = withContext(Dispatchers.IO) {
+    suspend fun episodes(anime: Anime): List<Episode> = episodeCache.getOrLoad(anime.slug) { loadEpisodes(anime) }
+
+    suspend fun localizeEpisodeTitle(anime: Anime, episode: Episode): Episode =
+        if (anime.slug.startsWith("hi:")) hi.localizeEpisodeTitle(episode) else episode
+
+    private suspend fun loadEpisodes(anime: Anime): List<Episode> = withContext(Dispatchers.IO) {
         if (anime.slug.startsWith("https://animesdrive.cloud/") || anime.slug.startsWith("https://goyabu.io/")) return@withContext externalEpisodes(anime)
         if (anime.slug.startsWith("hi:")) return@withContext hi.episodes(anime.copy(slug = anime.slug.removePrefix("hi:")))
         if (anime.slug.startsWith("https://animesdigital.org/")) return@withContext digitalEpisodes(anime)
@@ -118,7 +133,9 @@ class AnimeRepository {
 
     }
 
-    suspend fun seasons(anime: Anime): List<Anime> = withContext(Dispatchers.IO) {
+    suspend fun seasons(anime: Anime): List<Anime> = seasonsCache.getOrLoad(anime.slug) { loadSeasons(anime) }
+
+    private suspend fun loadSeasons(anime: Anime): List<Anime> = withContext(Dispatchers.IO) {
         if (anime.slug.startsWith("https://animesdrive.cloud/") || anime.slug.startsWith("https://goyabu.io/")) return@withContext listOf(anime)
         if (anime.slug.startsWith("hi:")) return@withContext hi.seasons(anime.copy(slug = anime.slug.removePrefix("hi:"))).map { it.copy(slug = "hi:" + it.slug) }
         if (anime.slug.startsWith("https://animesdigital.org/")) return@withContext listOf(anime)

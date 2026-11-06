@@ -69,6 +69,12 @@ class TitleMatchingTest {
         assertEquals(listOf(alias), filterRelevantResults(listOf(alias, unrelated), "Os sete pecados capitais", setOf(123)))
         assertEquals(listOf(alias, unrelated), filterRelevantResults(listOf(alias, unrelated), "nome desconhecido", emptySet()))
     }
+    @Test fun knownPortugueseAliasFiltersProviderNoiseWhenAniListHasNoIdentity() {
+        val aliases = HiAnimeRepository().searchAliases("Os sete pecados capitais")
+        val target = Anime("target", "Nanatsu no Taizai")
+        val unrelated = Anime("unrelated", "The Seven Heavenly Virtues")
+        assertEquals(listOf(target), filterRelevantResults(listOf(target, unrelated), "Os sete pecados capitais", emptySet(), aliases))
+    }
     @Test fun moviesAndSeasonsRemainDistinctWithoutIdentity() {
         assertNotEquals(matchingTitle("Anime Filme", null), matchingTitle("Anime Temporada 2", null))
     }

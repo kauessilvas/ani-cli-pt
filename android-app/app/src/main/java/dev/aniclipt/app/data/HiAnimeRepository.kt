@@ -15,6 +15,10 @@ import java.net.URL
 import java.net.URLEncoder
 
 class HiAnimeRepository {
+    private val titleTranslationSemaphore = Semaphore(3)
+
+    fun searchAliases(query: String): List<String> = titleSearchAliases[normalizeMatchText(query)].orEmpty()
+
     suspend fun airing(): List<Anime> = withContext(Dispatchers.IO) {
         parseCatalog(fetch("$BASE/top-airing"))
     }
@@ -63,12 +67,15 @@ class HiAnimeRepository {
             val title = element.attr("title").ifBlank { "Episódio $number" }
             if (episodeId.isBlank() || number.isBlank()) null else Episode(episodeId, number, title, title)
         }
-        val semaphore = Semaphore(4)
-        listed.map { episode -> async {
-            val genericTitle = Regex("^(episode|epis[oó]dio)\\s*${Regex.escape(episode.number)}$", RegexOption.IGNORE_CASE)
-            if (genericTitle.matches(episode.title)) episode.copy(title = "Episódio ${episode.number}")
-            else semaphore.withPermit { episode.copy(title = translatePtBr(episode.title)) }
-        } }.awaitAll()
+        listed
+    }
+
+    suspend fun localizeEpisodeTitle(episode: Episode): Episode = withContext(Dispatchers.IO) {
+        val original = episode.originalTitle.ifBlank { episode.title }
+        val genericTitle = Regex("^(episode|epis[oó]dio)\\s*${Regex.escape(episode.number)}$", RegexOption.IGNORE_CASE)
+        if (genericTitle.matches(original)) return@withContext episode.copy(title = "Episódio ${episode.number}", originalTitle = original)
+        val translated = titleTranslationSemaphore.withPermit { translatePtBr(original) }
+        episode.copy(title = translated, originalTitle = original)
     }
 
     suspend fun seasons(anime: Anime): List<Anime> = withContext(Dispatchers.IO) {

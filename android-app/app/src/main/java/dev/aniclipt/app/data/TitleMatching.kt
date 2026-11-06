@@ -2,17 +2,35 @@ package dev.aniclipt.app.data
 
 import java.text.Normalizer
 import java.util.Locale
+import java.util.Collections
 
-internal fun normalizeMatchText(value: String): String =
+private fun <K, V> boundedLruCache(maxEntries: Int): MutableMap<K, V> =
+    Collections.synchronizedMap(object : LinkedHashMap<K, V>(16, .75f, true) {
+        override fun removeEldestEntry(eldest: MutableMap.MutableEntry<K, V>?): Boolean = size > maxEntries
+    })
+
+private val diacriticsPattern = Regex("\\p{Mn}+")
+private val episodePattern = Regex("(?i)\\b(?:s\\d{1,2}e\\d{1,3}|\\d{1,2}x\\d{1,3})\\b")
+private val punctuationPattern = Regex("[^a-z0-9]+")
+private val audioSuffixPattern = Regex("(?i)\\s*(?:[-–—]\\s*)?\\b(?:dublado|legendado)\\b\\s*$")
+private val movieFormatPattern = Regex("\\b(movie|filme|film)\\b")
+private val tvFormatPattern = Regex("\\b(tv|season|temporada)\\b")
+private val partPattern = Regex("\\b(?:part|parte|cour)\\s*(\\d{1,2})\\b")
+private val ignoredTitleTokens = setOf("the", "movie", "filme", "film", "tv", "dublado", "legendado")
+private val normalizedTextCache = boundedLruCache<String, String>(2048)
+private val titleTokenCache = boundedLruCache<String, Set<String>>(1024)
+
+internal fun normalizeMatchText(value: String): String = normalizedTextCache[value] ?: run {
     Normalizer.normalize(value, Normalizer.Form.NFD)
-        .replace(Regex("\\p{Mn}+"), "")
+        .replace(diacriticsPattern, "")
         .lowercase(Locale.ROOT)
-        .replace(Regex("(?i)\\b(?:s\\d{1,2}e\\d{1,3}|\\d{1,2}x\\d{1,3})\\b"), " ")
-        .replace(Regex("[^a-z0-9]+"), " ")
+        .replace(episodePattern, " ")
+        .replace(punctuationPattern, " ")
         .trim()
+        .also { normalizedTextCache[value] = it }
+}
 
-private fun withoutAudioSuffix(title: String) =
-    title.replace(Regex("(?i)\\s*(?:[-–—]\\s*)?\\b(?:dublado|legendado)\\b\\s*$"), "")
+private fun withoutAudioSuffix(title: String) = title.replace(audioSuffixPattern, "")
 
 internal fun matchingTitle(title: String, canonicalId: Int?): String =
     canonicalId?.let { "anilist:$it" } ?: normalizeMatchText(withoutAudioSuffix(title))
@@ -33,13 +51,13 @@ internal fun explicitSeason(title: String, slug: String = ""): Int? {
 
 private fun explicitPart(title: String): Int? {
     val text = normalizeMatchText(title)
-    return Regex("\\b(?:part|parte|cour)\\s*(\\d{1,2})\\b").find(text)?.groupValues?.get(1)?.toIntOrNull()
+    return partPattern.find(text)?.groupValues?.get(1)?.toIntOrNull()
 }
 
 internal fun explicitFormat(title: String, metadata: List<String> = emptyList()): String? {
     val text = normalizeMatchText(title)
-    if (Regex("\\b(movie|filme|film)\\b").containsMatchIn(text)) return "MOVIE"
-    if (Regex("\\b(tv|season|temporada)\\b").containsMatchIn(text)) return "TV"
+    if (movieFormatPattern.containsMatchIn(text)) return "MOVIE"
+    if (tvFormatPattern.containsMatchIn(text)) return "TV"
     val formats = metadata.map { normalizeMatchText(it) }.toSet()
     return when {
         formats.any { it in setOf("movie", "filme", "film") } -> "MOVIE"
@@ -50,8 +68,8 @@ internal fun explicitFormat(title: String, metadata: List<String> = emptyList())
 
 internal fun identityScore(title: String, format: String, titles: List<String>, sourceFormat: String? = explicitFormat(title)): Double? {
     if (sourceFormat == "MOVIE" && format != "MOVIE" || sourceFormat == "TV" && format == "MOVIE") return null
-    fun tokens(value: String) = normalizeMatchText(withoutAudioSuffix(value)).split(' ')
-        .filter { it.isNotBlank() && it !in setOf("the", "movie", "filme", "film", "tv", "dublado", "legendado") }.toSet()
+    fun tokens(value: String): Set<String> = titleTokenCache[value] ?: normalizeMatchText(withoutAudioSuffix(value)).split(' ')
+        .filter { it.isNotBlank() && it !in ignoredTitleTokens }.toSet().also { titleTokenCache[value] = it }
     val input = tokens(title)
     if (input.isEmpty()) return null
     val season = explicitSeason(title)
@@ -89,12 +107,12 @@ internal fun sameEpisodeNumber(first: String, second: String): Boolean {
 }
 
 /** Filter provider noise only when there is at least one reliable result. */
-internal fun filterRelevantResults(results: List<Anime>, query: String, queryIds: Set<Int>): List<Anime> {
-    val normalizedQuery = normalizeMatchText(query)
-    if (normalizedQuery.isBlank()) return results
+internal fun filterRelevantResults(results: List<Anime>, query: String, queryIds: Set<Int>, relatedTitles: List<String> = emptyList()): List<Anime> {
+    val normalizedQueries = (listOf(query) + relatedTitles).map(::normalizeMatchText).filter(String::isNotBlank).distinct()
+    if (normalizedQueries.isEmpty()) return results
     val relevant = results.filter { anime ->
         (listOf(anime) + anime.alternatives).any { candidate ->
-            normalizeMatchText(candidate.title).contains(normalizedQuery) ||
+            normalizedQueries.any { normalizeMatchText(candidate.title).contains(it) } ||
                 candidate.anilistId?.let { it in queryIds } == true
         }
     }
