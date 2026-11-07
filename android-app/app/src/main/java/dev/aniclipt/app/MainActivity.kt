@@ -26,9 +26,16 @@ import androidx.activity.compose.BackHandler
 import androidx.core.splashscreen.SplashScreen.Companion.installSplashScreen
 import androidx.compose.animation.animateColorAsState
 import androidx.compose.animation.AnimatedVisibility
+import androidx.compose.animation.AnimatedContent
 import androidx.compose.animation.Crossfade
 import androidx.compose.animation.animateContentSize
+import androidx.compose.animation.fadeIn
+import androidx.compose.animation.fadeOut
+import androidx.compose.animation.slideInHorizontally
+import androidx.compose.animation.slideOutHorizontally
+import androidx.compose.animation.togetherWith
 import androidx.compose.animation.core.Animatable
+import androidx.compose.animation.core.animateFloatAsState
 import androidx.compose.animation.core.FastOutSlowInEasing
 import androidx.compose.animation.core.tween
 import androidx.activity.compose.setContent
@@ -36,6 +43,7 @@ import androidx.compose.foundation.background
 import androidx.compose.foundation.Image
 import androidx.compose.foundation.border
 import androidx.compose.foundation.clickable
+import androidx.compose.foundation.interaction.MutableInteractionSource
 import androidx.compose.foundation.layout.*
 import androidx.compose.foundation.lazy.LazyRow
 import androidx.compose.foundation.lazy.LazyColumn
@@ -56,6 +64,7 @@ import androidx.compose.material.icons.filled.PlayArrow
 import androidx.compose.material.icons.filled.Pause
 import androidx.compose.material.icons.filled.Replay10
 import androidx.compose.material.icons.filled.Forward10
+import androidx.compose.material.icons.filled.FastForward
 import androidx.compose.material.icons.filled.SkipPrevious
 import androidx.compose.material.icons.filled.SkipNext
 import androidx.compose.material.icons.filled.ScreenRotation
@@ -65,6 +74,7 @@ import androidx.compose.material.icons.filled.KeyboardArrowDown
 import androidx.compose.material.icons.filled.DeleteOutline
 import androidx.compose.material.icons.filled.Close
 import androidx.compose.material.icons.filled.CheckCircle
+import androidx.compose.material.icons.filled.Check
 import androidx.compose.material.icons.filled.ErrorOutline
 import androidx.compose.material.icons.filled.Visibility
 import androidx.compose.material.icons.filled.VisibilityOff
@@ -118,6 +128,9 @@ import coil.compose.rememberAsyncImagePainter
 import coil.request.ImageRequest
 import dev.aniclipt.app.data.Anime
 import dev.aniclipt.app.data.AnimeRepository
+import dev.aniclipt.app.data.AniSkipRepository
+import dev.aniclipt.app.data.SkipInterval
+import dev.aniclipt.app.data.activeSkipInterval
 import dev.aniclipt.app.data.Episode
 import dev.aniclipt.app.data.PlaybackSource
 import dev.aniclipt.app.data.DubSuggestion
@@ -555,10 +568,10 @@ private fun AnimeHome(lightTheme: Boolean, onLightTheme: (Boolean) -> Unit) {
         items.forEach { anime -> launch {
             val updated = catalogSemaphore.withPermit { runCatching { repository.catalogSynopsis(anime) }.getOrNull() } ?: return@launch
             if (isAiring) {
-                airing = airing.map { if (it.slug == updated.slug) it.copy(synopsis = updated.synopsis, isAdult = updated.isAdult ?: it.isAdult, availability = updated.availability) else it }
-                if (featured?.slug == updated.slug && featured?.synopsis.isNullOrBlank()) featured = featured?.copy(synopsis = updated.synopsis, isAdult = updated.isAdult ?: featured?.isAdult, availability = updated.availability)
+                airing = airing.map { if (it.slug == updated.slug) it.copy(synopsis = updated.synopsis, isAdult = updated.isAdult ?: it.isAdult, availability = updated.availability, confirmedAudio = updated.confirmedAudio) else it }
+                if (featured?.slug == updated.slug) featured = featured?.copy(synopsis = updated.synopsis.ifBlank { featured?.synopsis.orEmpty() }, isAdult = updated.isAdult ?: featured?.isAdult, availability = updated.availability, confirmedAudio = updated.confirmedAudio)
             }
-            if (generation == searchGeneration) results = results.map { if (it.slug == updated.slug) it.copy(synopsis = updated.synopsis, isAdult = updated.isAdult ?: it.isAdult, availability = updated.availability) else it }
+            if (generation == searchGeneration) results = results.map { if (it.slug == updated.slug) it.copy(synopsis = updated.synopsis, isAdult = updated.isAdult ?: it.isAdult, availability = updated.availability, confirmedAudio = updated.confirmedAudio) else it }
         } }
         }
         if (isAiring) airingJob = parent else catalogJob = parent
@@ -1190,7 +1203,7 @@ private fun AnimeRow(anime: Anime, favorite: Boolean, onClick: () -> Unit, onFav
         AsyncImage(model = anime.poster, contentDescription = anime.title, modifier = Modifier.width(if (compact) 68.dp else 82.dp).height(if (compact) 96.dp else 112.dp).clip(RoundedCornerShape(14.dp)), contentScale = ContentScale.Crop)
         Column(Modifier.weight(1f).padding(horizontal = if (compact) 10.dp else 14.dp)) {
             Text(anime.title, fontWeight = FontWeight.SemiBold, fontSize = 15.sp, maxLines = 2)
-            Text(anime.metadata.joinToString(" · ").ifBlank { "Detalhes no episódio" }, color = Muted, fontSize = 11.sp, modifier = Modifier.padding(top = 4.dp))
+            Text(anime.metadata.firstOrNull { it in setOf("AnimeFire", "AnimesDigital", "AnimeDrive", "HiAnime") } ?: "Detalhes no episódio", color = Muted, fontSize = 11.sp, modifier = Modifier.padding(top = 4.dp))
             Text(anime.synopsis.ifBlank { "Sinopse indisponível no momento" }, color = Muted, fontSize = 11.sp, maxLines = 2, modifier = Modifier.padding(top = 5.dp))
             FlowRow(Modifier.padding(top = 7.dp), horizontalArrangement = Arrangement.spacedBy(6.dp), verticalArrangement = Arrangement.spacedBy(5.dp)) {
                 catalogTags(anime).forEach { Tag(it.uppercase()) }
@@ -1674,10 +1687,7 @@ private fun EpisodeSheet(anime: Anime, episodes: List<Episode>, watched: Set<Str
                         if (loadingEpisode?.id == episode.id) CircularProgressIndicator(modifier = Modifier.size(30.dp), color = Color.White, strokeWidth = 3.dp)
                         else Icon(Icons.Default.PlayArrow, contentDescription = null, tint = Color.White, modifier = Modifier.size(38.dp).clip(RoundedCornerShape(50)).background(Color.Black.copy(.55f)).padding(5.dp))
                     }
-                    Column(Modifier.weight(1f).padding(start = 12.dp)) {
-                        Text("EP.${episode.number}" + if (episode.title == "Episódio ${episode.number}" || episode.title.isBlank()) "" else " - ${episode.title}", fontWeight = FontWeight.SemiBold, fontSize = 13.sp, maxLines = 2)
-                        Text("Assistir episódio", color = Muted, fontSize = 11.sp, modifier = Modifier.padding(top = 5.dp))
-                    }
+                    Text("EP.${episode.number}" + if (episode.title == "Episódio ${episode.number}" || episode.title.isBlank()) "" else " - ${episode.title}", modifier = Modifier.weight(1f).padding(start = 12.dp), fontWeight = FontWeight.SemiBold, fontSize = 13.sp, maxLines = 2)
                 }
             }
         }
@@ -1694,7 +1704,12 @@ private fun LoadingPlayer(title: String, episode: Episode?, error: String?, awai
         controller?.hide(WindowInsetsCompat.Type.systemBars())
         onDispose { controller?.show(WindowInsetsCompat.Type.systemBars()) }
     }
-    Box(modifier.background(Color.Black)) {
+    // Consume touches across the whole loading screen so catalog cards behind it cannot open.
+    Box(modifier.background(Color.Black).clickable(
+        interactionSource = remember { MutableInteractionSource() },
+        indication = null,
+        onClick = {},
+    )) {
         Row(Modifier.align(Alignment.TopStart).fillMaxWidth().background(Brush.verticalGradient(listOf(Color(0xCC1A1A1E), Color.Transparent))).padding(horizontal = 8.dp, vertical = 6.dp), verticalAlignment = Alignment.CenterVertically) {
             IconButton(onClick = onClose) { Icon(Icons.Default.ArrowBack, "Voltar aos episódios", tint = Color.White) }
             Column(Modifier.weight(1f).padding(start = 4.dp)) {
@@ -1727,13 +1742,14 @@ private fun NativePlayer(source: PlaybackSource, anime: Anime?, episode: Episode
     val activity = context as? Activity
     val configuration = LocalConfiguration.current
     val isLandscape = configuration.orientation == Configuration.ORIENTATION_LANDSCAPE
+    val cutoutTop = WindowInsets.displayCutout.asPaddingValues().calculateTopPadding()
     val previousOrientation = remember(source.videoUrl) { activity?.requestedOrientation ?: ActivityInfo.SCREEN_ORIENTATION_UNSPECIFIED }
     val lifecycleOwner = LocalLifecycleOwner.current
     val playbackError = remember(source.videoUrl) { mutableStateOf<String?>(null) }
     val trackSelector = remember(source.videoUrl) { DefaultTrackSelector(context) }
-    var qualityMenuExpanded by remember(source.videoUrl) { mutableStateOf(false) }
-    var aspectMenuExpanded by remember(source.videoUrl) { mutableStateOf(false) }
-    var speedMenuExpanded by remember(source.videoUrl) { mutableStateOf(false) }
+    var settingsMenuExpanded by remember(source.videoUrl) { mutableStateOf(false) }
+    var settingsPage by remember(source.videoUrl) { mutableStateOf("root") }
+    val settingsGearRotation by animateFloatAsState(if (settingsMenuExpanded) 45f else 0f, tween(200, easing = FastOutSlowInEasing), label = "settingsGearRotation")
     var positionMs by remember(source.videoUrl) { mutableLongStateOf(startPositionMs) }
     var durationMs by remember(source.videoUrl) { mutableLongStateOf(0L) }
     var seekFraction by remember(source.videoUrl) { mutableFloatStateOf(0f) }
@@ -1743,6 +1759,7 @@ private fun NativePlayer(source: PlaybackSource, anime: Anime?, episode: Episode
     var controlsVisible by remember(source.videoUrl) { mutableStateOf(true) }
     var isPlaying by remember(source.videoUrl) { mutableStateOf(false) }
     var subtitleCueText by remember(source.videoUrl) { mutableStateOf("") }
+    var skipIntervals by remember(anime?.slug, episode?.id) { mutableStateOf<List<SkipInterval>>(emptyList()) }
     val insetsController = remember(activity, source.videoUrl) {
         activity?.window?.let { WindowInsetsControllerCompat(it, it.decorView) }
     }
@@ -1830,8 +1847,14 @@ private fun NativePlayer(source: PlaybackSource, anime: Anime?, episode: Episode
             delay(500)
         }
     }
-    LaunchedEffect(player, controlsVisible, isPlaying, controlInteraction, qualityMenuExpanded, aspectMenuExpanded, speedMenuExpanded, seeking) {
-        if (!controlsVisible || !isPlaying || qualityMenuExpanded || aspectMenuExpanded || speedMenuExpanded || seeking) return@LaunchedEffect
+    LaunchedEffect(anime?.slug, anime?.anilistId, episode?.id) {
+        skipIntervals = emptyList()
+        if (anime != null && episode != null) {
+            skipIntervals = runCatching { AniSkipRepository().intervals(anime, episode) }.getOrDefault(emptyList())
+        }
+    }
+    LaunchedEffect(player, controlsVisible, isPlaying, controlInteraction, settingsMenuExpanded, seeking) {
+        if (!controlsVisible || !isPlaying || settingsMenuExpanded || seeking) return@LaunchedEffect
         delay(4_500)
         controlsVisible = false
     }
@@ -1861,6 +1884,7 @@ private fun NativePlayer(source: PlaybackSource, anime: Anime?, episode: Episode
             if (player.currentPosition > 0L) currentWatchProgressCallback(unsavedMillis / 1_000L, player.currentPosition, player.duration.coerceAtLeast(0L), false)
         }
     }
+    val skipInterval = activeSkipInterval(skipIntervals, positionMs, durationMs)
     Box(modifier.background(Color.Black), contentAlignment = Alignment.Center) {
             AndroidView(
                 factory = { viewContext -> PlayerView(viewContext).apply {
@@ -1891,14 +1915,78 @@ private fun NativePlayer(source: PlaybackSource, anime: Anime?, episode: Episode
                 },
                 modifier = Modifier.align(subtitleAlignment).fillMaxWidth().wrapContentHeight()
                     .padding(horizontal = 22.dp)
-                    .padding(top = if (compactLandscapeSubtitle) 64.dp else if (subtitlePosition == "top") if (controlsVisible) 64.dp else 18.dp else 0.dp, bottom = if (subtitlePosition == "bottom" && !compactLandscapeSubtitle) if (controlsVisible) 140.dp else if (isLandscape) 26.dp else 42.dp else 0.dp),
+                    .padding(top = if (compactLandscapeSubtitle) 64.dp + cutoutTop else if (subtitlePosition == "top") if (controlsVisible && !isLandscape && skipInterval != null) 132.dp + cutoutTop else if (controlsVisible) 64.dp + cutoutTop else 18.dp else 0.dp, bottom = if (subtitlePosition == "bottom" && !compactLandscapeSubtitle) if (controlsVisible) 140.dp else if (isLandscape) 26.dp else 42.dp else 0.dp),
             )
+            if (isLandscape && skipInterval != null) {
+                SkipSegmentButton(
+                    skipInterval,
+                    onClick = { player.seekTo(skipInterval.endMs); positionMs = skipInterval.endMs; controlInteraction++ },
+                    modifier = Modifier.align(Alignment.BottomEnd).windowInsetsPadding(WindowInsets.displayCutout)
+                        .padding(end = 24.dp, bottom = if (controlsVisible) 142.dp else 72.dp),
+                )
+            }
             if (controlsVisible) {
-                Row(Modifier.align(Alignment.TopStart).fillMaxWidth().background(Brush.verticalGradient(listOf(Color.Black.copy(.85f), Color.Transparent))).padding(horizontal = 8.dp, vertical = 6.dp), verticalAlignment = Alignment.CenterVertically) {
-                    IconButton(onClick = onClose) { Icon(Icons.Default.ArrowBack, "Voltar", tint = Color.White) }
-                    Column(Modifier.weight(1f).padding(start = 4.dp)) {
-                        Text(source.title, color = Color.White, fontWeight = FontWeight.Bold, fontSize = 14.sp, maxLines = 1)
-                        Text("Episódio ${source.episode}", color = Color.White.copy(.75f), fontSize = 11.sp, maxLines = 1)
+                Column(Modifier.align(Alignment.TopCenter).fillMaxWidth()
+                    .background(Brush.verticalGradient(listOf(Color.Black.copy(.9f), Color.Black.copy(.55f), Color.Transparent)))
+                    .windowInsetsPadding(WindowInsets.displayCutout)
+                    .padding(start = if (isLandscape) 12.dp else 20.dp, end = if (isLandscape) 12.dp else 20.dp, top = 8.dp, bottom = if (isLandscape) 6.dp else 12.dp)) {
+                    Row(Modifier.fillMaxWidth(), verticalAlignment = Alignment.CenterVertically) {
+                        IconButton(onClick = onClose) { Icon(Icons.Default.ArrowBack, "Voltar", tint = Color.White) }
+                        Column(Modifier.weight(1f).padding(start = 4.dp)) {
+                            Text(source.title, color = Color.White, fontWeight = FontWeight.Bold, fontSize = 14.sp, maxLines = 1)
+                            Text("Episódio ${source.episode}", color = Color.White.copy(.75f), fontSize = 11.sp, maxLines = 1)
+                        }
+                        Box {
+                            IconButton(onClick = { settingsPage = "root"; settingsMenuExpanded = true; controlInteraction++ }) {
+                                Icon(Icons.Default.Settings, "Configurações do player", modifier = Modifier.graphicsLayer { rotationZ = settingsGearRotation }, tint = Color.White)
+                            }
+                            DropdownMenu(
+                                expanded = settingsMenuExpanded,
+                                onDismissRequest = { settingsMenuExpanded = false; settingsPage = "root"; controlInteraction++ },
+                                modifier = Modifier.width(260.dp).background(Color(0xFF202024)),
+                            ) {
+                                AnimatedContent(
+                                    targetState = settingsPage,
+                                    transitionSpec = {
+                                        (slideInHorizontally(tween(180)) { if (targetState == "root") -it / 6 else it / 6 } + fadeIn(tween(180))) togetherWith
+                                            (slideOutHorizontally(tween(140)) { if (targetState == "root") it / 6 else -it / 6 } + fadeOut(tween(140)))
+                                    },
+                                    label = "playerSettingsPage",
+                                ) { page ->
+                                    Column {
+                                    if (page == "root") {
+                                        Text("CONFIGURAÇÕES", modifier = Modifier.padding(horizontal = 16.dp, vertical = 10.dp), color = Muted, fontSize = 11.sp, fontWeight = FontWeight.Bold, letterSpacing = 1.sp)
+                                        DropdownMenuItem(text = { Text("Resolução") }, trailingIcon = { Text(qualityLabel(quality), color = Muted) }, onClick = { settingsPage = "quality" })
+                                        DropdownMenuItem(text = { Text("Velocidade") }, trailingIcon = { Text(speedLabel(speed), color = Muted) }, onClick = { settingsPage = "speed" })
+                                        DropdownMenuItem(text = { Text("Proporção de tela") }, trailingIcon = { Text(aspectRatioLabel(aspectRatio), color = Muted) }, onClick = { settingsPage = "aspect" })
+                                    } else {
+                                        val heading = when (page) { "quality" -> "Resolução"; "speed" -> "Velocidade"; else -> "Proporção de tela" }
+                                        DropdownMenuItem(text = { Text("‹  $heading", fontWeight = FontWeight.SemiBold) }, onClick = { settingsPage = "root" })
+                                        HorizontalDivider(color = Color.White.copy(alpha = .12f))
+                                        when (page) {
+                                            "quality" -> (listOf("best" to "Automática") + source.availableVideoHeights.map { "${it}p" to "${it}p" }).forEach { (value, label) ->
+                                                DropdownMenuItem(text = { Text(label) }, trailingIcon = { if (quality == value) Icon(Icons.Default.Check, null, tint = Accent) }, onClick = { onQuality(value); settingsMenuExpanded = false; settingsPage = "root"; controlInteraction++ })
+                                            }
+                                            "speed" -> listOf(.25f, .5f, 1.5f, 2f).forEach { value ->
+                                                DropdownMenuItem(text = { Text(speedLabel(value)) }, trailingIcon = { if (speed == value) Icon(Icons.Default.Check, null, tint = Accent) }, onClick = { speed = value; player.setPlaybackSpeed(value); settingsMenuExpanded = false; settingsPage = "root"; controlInteraction++ })
+                                            }
+                                            "aspect" -> listOf("fit" to "Ajustar", "crop" to "Preencher", "stretch" to "Esticar").forEach { (value, label) ->
+                                                DropdownMenuItem(text = { Text(label) }, trailingIcon = { if (aspectRatio == value) Icon(Icons.Default.Check, null, tint = Accent) }, onClick = { onAspectRatio(value); settingsMenuExpanded = false; settingsPage = "root"; controlInteraction++ })
+                                            }
+                                        }
+                                    }
+                                    }
+                                }
+                            }
+                        }
+                        IconButton(onClick = { activity?.requestedOrientation = if (isLandscape) ActivityInfo.SCREEN_ORIENTATION_PORTRAIT else ActivityInfo.SCREEN_ORIENTATION_LANDSCAPE; controlInteraction++ }) {
+                            Icon(Icons.Default.ScreenRotation, if (isLandscape) "Voltar para modo retrato" else "Girar para modo paisagem", tint = Color.White)
+                        }
+                    }
+                    if (!isLandscape && skipInterval != null) {
+                        Row(Modifier.fillMaxWidth().padding(top = 8.dp), horizontalArrangement = Arrangement.End) {
+                            SkipSegmentButton(skipInterval, onClick = { player.seekTo(skipInterval.endMs); positionMs = skipInterval.endMs; controlInteraction++ })
+                        }
                     }
                 }
                 Row(Modifier.align(Alignment.Center), verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(4.dp)) {
@@ -1918,34 +2006,6 @@ private fun NativePlayer(source: PlaybackSource, anime: Anime?, episode: Episode
                     Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.SpaceBetween) {
                         Text(formatPlaybackTime(if (seeking) (durationMs * seekFraction).toLong() else positionMs), color = Color.White, fontSize = 11.sp)
                         Text(formatPlaybackTime(durationMs), color = Color.White.copy(.8f), fontSize = 11.sp)
-                    }
-                    LazyRow(verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(2.dp)) {
-                        item {
-                            Box {
-                                TextButton(onClick = { qualityMenuExpanded = true }, contentPadding = PaddingValues(horizontal = 8.dp)) { Text("${qualityLabel(quality)} ▾", color = Color.White, fontSize = 11.sp) }
-                                DropdownMenu(expanded = qualityMenuExpanded, onDismissRequest = { qualityMenuExpanded = false; controlInteraction++ }) {
-                                    DropdownMenuItem(text = { Text("Automática") }, onClick = { onQuality("best"); qualityMenuExpanded = false; controlInteraction++ })
-                                    source.availableVideoHeights.forEach { height -> DropdownMenuItem(text = { Text("${height}p") }, onClick = { onQuality("${height}p"); qualityMenuExpanded = false; controlInteraction++ }) }
-                                }
-                            }
-                        }
-                        item {
-                            Box {
-                                TextButton(onClick = { speedMenuExpanded = true }, contentPadding = PaddingValues(horizontal = 8.dp)) { Text("${speed}× ▾", color = Color.White, fontSize = 11.sp) }
-                                DropdownMenu(expanded = speedMenuExpanded, onDismissRequest = { speedMenuExpanded = false; controlInteraction++ }) {
-                                    listOf(.25f, .5f, .75f, 1f, 1.25f, 1.5f, 1.75f, 2f).forEach { value -> DropdownMenuItem(text = { Text(if (value == 1f) "Normal" else "$value×") }, onClick = { speed = value; player.setPlaybackSpeed(value); speedMenuExpanded = false; controlInteraction++ }) }
-                                }
-                            }
-                        }
-                        item {
-                            Box {
-                                TextButton(onClick = { aspectMenuExpanded = true }, contentPadding = PaddingValues(horizontal = 8.dp)) { Text("${aspectRatioLabel(aspectRatio)} ▾", color = Color.White, fontSize = 11.sp) }
-                                DropdownMenu(expanded = aspectMenuExpanded, onDismissRequest = { aspectMenuExpanded = false; controlInteraction++ }) {
-                                    listOf("fit" to "Ajustar", "crop" to "Preencher", "stretch" to "Esticar").forEach { (value, label) -> DropdownMenuItem(text = { Text(label) }, onClick = { onAspectRatio(value); aspectMenuExpanded = false; controlInteraction++ }) }
-                                }
-                            }
-                        }
-                        item { IconButton(onClick = { activity?.requestedOrientation = if (isLandscape) ActivityInfo.SCREEN_ORIENTATION_PORTRAIT else ActivityInfo.SCREEN_ORIENTATION_LANDSCAPE; controlInteraction++ }) { Icon(Icons.Default.ScreenRotation, if (isLandscape) "Voltar para modo retrato" else "Girar para modo paisagem", tint = Color.White) } }
                     }
                 }
             }
@@ -1968,10 +2028,31 @@ private fun NativePlayer(source: PlaybackSource, anime: Anime?, episode: Episode
     }
 }
 
+@Composable
+private fun SkipSegmentButton(interval: SkipInterval, onClick: () -> Unit, modifier: Modifier = Modifier) {
+    val shape = RoundedCornerShape(12.dp)
+    Row(
+        modifier.shadow(10.dp, shape).clip(shape).background(Color(0xEB1C1C20))
+            .border(1.dp, Color.White.copy(alpha = .18f), shape)
+            .clickable(onClick = onClick).heightIn(min = 48.dp).padding(horizontal = 14.dp),
+        verticalAlignment = Alignment.CenterVertically,
+        horizontalArrangement = Arrangement.spacedBy(9.dp),
+    ) {
+        Icon(Icons.Default.FastForward, contentDescription = null, tint = Accent, modifier = Modifier.size(20.dp))
+        Text(interval.label, color = Color.White, fontSize = 13.sp, fontWeight = FontWeight.SemiBold)
+    }
+}
+
 private fun aspectRatioLabel(value: String): String = when (value) {
     "crop" -> "Preencher"
     "stretch" -> "Esticar"
     else -> "Ajustar"
+}
+
+private fun speedLabel(value: Float): String = when (value) {
+    1f -> "Normal"
+    2f -> "2×"
+    else -> "$value×"
 }
 
 @androidx.annotation.OptIn(androidx.media3.common.util.UnstableApi::class)

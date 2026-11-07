@@ -178,6 +178,10 @@ Para preparar uma release, execute `scripts/publish-android-release.sh --check-o
 
 O aplicativo mantém buscas e detalhes recentemente consultados em cache temporário na memória, com prazo e limite de itens. O cache é recriado ao fechar o processo do app; falhas de rede e sinopses ausentes não são guardadas como resultados permanentes.
 
-Nas configurações, é possível ocultar conteúdo adulto identificado pelos metadados das fontes. A classificação pode estar ausente ou incompleta; a opção não garante a ocultação de todos os títulos +18. Os cartões mostram apenas idiomas e formatos informados pelas fontes. Títulos sem episódios e sem alternativas associadas são removidos quando essa informação é confirmada; uma lista de episódios não garante que todos os vídeos estejam funcionando.
+O animesonline.cloud é consultado somente como último recurso quando as fontes normais não conseguem reproduzir o episódio. Ele não participa do catálogo, da busca visível, dos cards ou dos metadados. O fallback exige título e episódio correspondentes, áudio explicitamente identificado e um link direto de vídeo acessível; quando essas condições não são atendidas, o app mantém o erro ou a escolha de áudio original.
+
+Nas configurações, é possível ocultar conteúdo adulto identificado pelos metadados das fontes. A classificação pode estar ausente ou incompleta; a opção não garante a ocultação de todos os títulos +18. Os cartões só mostram tags de áudio quando um stream ativo foi encontrado em um dos episódios consultados; a disponibilidade pode variar entre episódios e mudar depois da consulta. Títulos sem episódios e sem alternativas associadas são removidos quando essa informação é confirmada; uma lista de episódios não garante que todos os vídeos estejam funcionando.
 
 O player oferece controles de reprodução, progresso, velocidade, qualidade e proporção. A aparência de legendas separadas pode ser personalizada nas configurações; legendas gravadas na imagem não podem ser modificadas.
+
+Quando o AniSkip informa os intervalos do episódio, o player mostra botões para pular a abertura e o encerramento durante esses trechos. Os intervalos são consultados pelo número do episódio e pelo identificador MyAnimeList encontrado via AniList. O botão não aparece quando faltam dados ou quando os tempos não cabem na duração do vídeo.

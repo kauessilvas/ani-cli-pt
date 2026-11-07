@@ -1,6 +1,6 @@
 package dev.aniclipt.app.data
 
-private val searchableProviders = setOf("AnimeFire", "AnimesDigital", "AnimeDrive", "Goyabu", "HiAnime")
+private val searchableProviders = setOf("AnimeFire", "AnimesDigital", "AnimeDrive", "HiAnime")
 
 internal fun needsRelatedTitleSearch(query: String, directResults: List<Anime>): Boolean {
     val normalizedQuery = normalizeMatchText(query)

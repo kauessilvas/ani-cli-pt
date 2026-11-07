@@ -1,6 +1,7 @@
 package dev.aniclipt.app.data
 
 import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.async
 import kotlinx.coroutines.awaitAll
 import kotlinx.coroutines.coroutineScope
@@ -26,6 +27,7 @@ data class Anime(
     val anilistId: Int? = null,
     val isAdult: Boolean? = null,
     val availability: Availability = Availability.UNKNOWN,
+    val confirmedAudio: Set<String> = emptySet(),
 )
 
 data class Episode(val id: String, val number: String, val title: String, val originalTitle: String = title, val thumbnail: String = "")
@@ -41,7 +43,7 @@ class AnimeRepository {
     private val fireDetailsCache = TimedRequestCache<String, String>(maxEntries = 128, ttlMillis = 5 * 60_000L)
     private val seasonPosterCache = TimedRequestCache<String, String>(maxEntries = 128, ttlMillis = 30 * 60_000L, shouldCache = { it.isNotBlank() })
     private val searchCache = TimedRequestCache<String, List<Anime>>(maxEntries = 32, ttlMillis = 2 * 60_000L, shouldCache = { it.isNotEmpty() })
-    private data class ArtworkFields(val poster: String, val banner: String, val synopsis: String, val isAdult: Boolean?, val availability: Availability)
+    private data class ArtworkFields(val poster: String, val banner: String, val synopsis: String, val isAdult: Boolean?, val availability: Availability, val confirmedAudio: Set<String>)
     private val artworkCache = TimedRequestCache<String, ArtworkFields>(maxEntries = 128, ttlMillis = 30 * 60_000L, shouldCache = { it.synopsis.isNotBlank() })
     suspend fun airing(): List<Anime> = airingCache.getOrLoad("airing") {
         withContext(Dispatchers.IO) { fireCatalog("$FIRE_BASE/animes?v=3") }
@@ -54,12 +56,11 @@ class AnimeRepository {
             "AnimeFire" -> fireCatalog("$FIRE_BASE/animes/pesquisar?v=3&q=${URLEncoder.encode(query, Charsets.UTF_8.name())}")
             "AnimesDigital" -> digitalSearch(query)
             "HiAnime" -> hi.search(query).map { it.copy(slug = "hi:" + it.slug, metadata = it.metadata + "HiAnime") }
-            "AnimeDrive" -> externalSearch(query, "https://animesdrive.cloud", false)
-            "Goyabu" -> externalSearch(query, "https://goyabu.io", true)
+            "AnimeDrive" -> externalSearch(query, "https://animesdrive.cloud")
             else -> emptyList()
         }
         val results = coroutineScope {
-            listOf("AnimeFire", "AnimesDigital", "AnimeDrive", "Goyabu", "HiAnime").map { name -> async { runCatching { fetchSource(name) }.getOrDefault(emptyList()) } }.awaitAll().flatten()
+            listOf("AnimeFire", "AnimesDigital", "AnimeDrive", "HiAnime").map { name -> async { runCatching { fetchSource(name) }.getOrDefault(emptyList()) } }.awaitAll().flatten()
         }.toMutableList()
         val identities = runCatching { aniListSearch(query) }.getOrDefault(emptyList())
         val normalizedQuery = normalizeMatchText(query)
@@ -119,7 +120,7 @@ class AnimeRepository {
         if (anime.slug.startsWith("hi:")) hi.localizeEpisodeTitle(episode) else episode
 
     private suspend fun loadEpisodes(anime: Anime): List<Episode> = withContext(Dispatchers.IO) {
-        if (anime.slug.startsWith("https://animesdrive.cloud/") || anime.slug.startsWith("https://goyabu.io/")) return@withContext externalEpisodes(anime)
+        if (anime.slug.startsWith("https://animesdrive.cloud/")) return@withContext externalEpisodes(anime)
         if (anime.slug.startsWith("hi:")) return@withContext hi.episodes(anime.copy(slug = anime.slug.removePrefix("hi:")))
         if (anime.slug.startsWith("https://animesdigital.org/")) return@withContext digitalEpisodes(anime)
         val data = fireAnime(anime)
@@ -136,7 +137,7 @@ class AnimeRepository {
     suspend fun seasons(anime: Anime): List<Anime> = seasonsCache.getOrLoad(anime.slug) { loadSeasons(anime) }
 
     private suspend fun loadSeasons(anime: Anime): List<Anime> = withContext(Dispatchers.IO) {
-        if (anime.slug.startsWith("https://animesdrive.cloud/") || anime.slug.startsWith("https://goyabu.io/")) return@withContext listOf(anime)
+        if (anime.slug.startsWith("https://animesdrive.cloud/")) return@withContext listOf(anime)
         if (anime.slug.startsWith("hi:")) return@withContext hi.seasons(anime.copy(slug = anime.slug.removePrefix("hi:"))).map { it.copy(slug = "hi:" + it.slug) }
         if (anime.slug.startsWith("https://animesdigital.org/")) return@withContext listOf(anime)
         val data = fireAnime(anime)
@@ -148,14 +149,14 @@ class AnimeRepository {
     suspend fun artwork(anime: Anime): Anime {
         val fields = artworkCache.getOrLoad(anime.slug) {
             val loaded = loadArtwork(anime)
-            ArtworkFields(loaded.poster, loaded.banner, loaded.synopsis, loaded.isAdult, loaded.availability)
+            ArtworkFields(loaded.poster, loaded.banner, loaded.synopsis, loaded.isAdult, loaded.availability, loaded.confirmedAudio)
         }
-        return anime.copy(poster = fields.poster.ifBlank { anime.poster }, banner = fields.banner.ifBlank { anime.banner }, synopsis = fields.synopsis, isAdult = fields.isAdult ?: anime.isAdult, availability = fields.availability)
+        return anime.copy(poster = fields.poster.ifBlank { anime.poster }, banner = fields.banner.ifBlank { anime.banner }, synopsis = fields.synopsis, isAdult = fields.isAdult ?: anime.isAdult, availability = fields.availability, confirmedAudio = fields.confirmedAudio)
     }
 
     private suspend fun loadArtwork(anime: Anime): Anime = withContext(Dispatchers.IO) {
         val details = runCatching { when {
-            anime.slug.startsWith("https://animesdrive.cloud/") || anime.slug.startsWith("https://goyabu.io/") -> externalArtwork(anime)
+            anime.slug.startsWith("https://animesdrive.cloud/") -> externalArtwork(anime)
             anime.slug.startsWith("hi:") -> hi.artwork(anime.copy(slug = anime.slug.removePrefix("hi:"))).copy(slug = anime.slug)
             anime.slug.startsWith("https://animesdigital.org/") -> anime
             else -> {
@@ -164,8 +165,10 @@ class AnimeRepository {
                 val episodes = data.optJSONArray("episodes")
                 val availability = availabilityFromEpisodeCount(episodes?.length(), anime.alternatives.isNotEmpty())
                 val genres = hero?.optJSONArray("genres")
-                val adult = if (genres != null && (0 until genres.length()).any { genres.optString(it).equals("hentai", true) }) true else anime.isAdult
-                if (hero == null) anime.copy(availability = availability) else anime.copy(availability = availability, isAdult = adult,
+                val labels = (0 until (genres?.length() ?: 0)).map { genres!!.optString(it) }
+                val adult = if (hasAdultContentLabels(labels)) true else anime.isAdult
+                val confirmedAudio = verifyFireAudio(episodes)
+                if (hero == null) anime.copy(availability = availability, confirmedAudio = confirmedAudio) else anime.copy(availability = availability, isAdult = adult, confirmedAudio = confirmedAudio,
                     banner = hero.optString("backdrop_src").takeUnless { it == "null" }.orEmpty().ifBlank { anime.banner },
                     poster = hero.optString("poster_src").takeUnless { it == "null" }.orEmpty().ifBlank { anime.poster },
                     synopsis = cleanSynopsis(hero.optString("synopsis")).ifBlank { cleanSynopsis(anime.synopsis) },
@@ -180,7 +183,7 @@ class AnimeRepository {
                 val synopsis = runCatching {
                     val candidate = when {
                         alternate.slug.startsWith("hi:") -> hi.artwork(alternate.copy(slug = alternate.slug.removePrefix("hi:")))
-                        alternate.slug.startsWith("https://animesdrive.cloud/") || alternate.slug.startsWith("https://goyabu.io/") -> externalArtwork(alternate)
+                        alternate.slug.startsWith("https://animesdrive.cloud/") -> externalArtwork(alternate)
                         !alternate.slug.startsWith("https://") -> {
                             val hero = fireAnime(alternate).optJSONObject("hero")
                             alternate.copy(synopsis = hero?.optString("synopsis").orEmpty())
@@ -214,13 +217,21 @@ class AnimeRepository {
         }
         suspend fun attempt(candidate: Anime, ep: Episode, audioDub: Boolean, allowOpen: Boolean): PlaybackSource? =
             runCatching { resolveSingle(candidate, ep, audioDub, allowOpen, openSubtitlesApiKey).copy(providerSlug = candidate.slug) }.getOrNull()
-        choosePlaybackSource(
-            dubbed = dubbed,
-            useExternalSubtitles = openSubtitlesEnabled && openSubtitlesApiKey.isNotBlank(),
-            originalSources = { matched.mapNotNull { (candidate, ep) -> attempt(candidate, ep, false, false) } },
-            externalSources = { matched.filter { it.first.slug.startsWith("hi:") }.mapNotNull { (candidate, ep) -> attempt(candidate, ep, false, true) } },
-            dubbedSources = { matched.mapNotNull { (candidate, ep) -> attempt(candidate, ep, true, if (dubbed) openSubtitlesEnabled else false) } },
-        )
+        try {
+            choosePlaybackSource(
+                dubbed = dubbed,
+                useExternalSubtitles = openSubtitlesEnabled && openSubtitlesApiKey.isNotBlank(),
+                originalSources = { matched.mapNotNull { (candidate, ep) -> attempt(candidate, ep, false, false) } },
+                externalSources = { matched.filter { it.first.slug.startsWith("hi:") }.mapNotNull { (candidate, ep) -> attempt(candidate, ep, false, true) } },
+                dubbedSources = { matched.mapNotNull { (candidate, ep) -> attempt(candidate, ep, true, if (dubbed) openSubtitlesEnabled else false) } },
+            )
+        } catch (failure: Exception) {
+            if (failure is CancellationException) throw failure
+            if (failure !is IllegalStateException && failure !is DubSuggestion || AnimesOnlineFallback.PROVIDER_SLUG in excludedSources) throw failure
+            try { AnimesOnlineFallback().resolve(anime, episode, dubbed) }
+            catch (cancelled: CancellationException) { throw cancelled }
+            catch (_: Exception) { throw failure }
+        }
     }
 
     private data class AniIdentity(val id: Int, val format: String, val romaji: String, val titles: List<String>, val isAdult: Boolean?)
@@ -232,7 +243,7 @@ class AnimeRepository {
         val request = URL("https://graphql.anilist.co").openConnection() as HttpURLConnection
         request.requestMethod = "POST"; request.doOutput = true; request.connectTimeout = 8000; request.readTimeout = 10000
         request.setRequestProperty("Content-Type", "application/json"); request.setRequestProperty("Accept", "application/json")
-        val payload = org.json.JSONObject().put("query", "query (\$search: String) { Page(perPage: 8) { media(search: \$search, type: ANIME) { id format isAdult title { romaji english native } synonyms } } }").put("variables", org.json.JSONObject().put("search", query))
+        val payload = org.json.JSONObject().put("query", "query (\$search: String) { Page(perPage: 8) { media(search: \$search, type: ANIME) { id format isAdult genres tags { name rank isMediaSpoiler } title { romaji english native } synonyms } } }").put("variables", org.json.JSONObject().put("search", query))
         return try {
             request.outputStream.bufferedWriter().use { it.write(payload.toString()) }
             if (request.responseCode !in 200..299) return emptyList()
@@ -242,14 +253,17 @@ class AnimeRepository {
                 val aliases = mutableListOf(title.optString("romaji"), title.optString("english"), title.optString("native"))
                 val synonyms = row.optJSONArray("synonyms")
                 if (synonyms != null) for (j in 0 until synonyms.length()) aliases.add(synonyms.optString(j))
-                AniIdentity(row.optInt("id"), row.optString("format"), title.optString("romaji"), aliases.filter { it.isNotBlank() && it != "null" }, if (row.has("isAdult") && !row.isNull("isAdult")) row.optBoolean("isAdult") else null)
+                val genres = row.optJSONArray("genres")?.let { values -> (0 until values.length()).map { values.optString(it) } }.orEmpty()
+                val tags = row.optJSONArray("tags")?.let { values -> (0 until values.length()).mapNotNull { index -> values.optJSONObject(index)?.takeUnless { it.optBoolean("isMediaSpoiler") }?.let { it.optString("name") to it.optInt("rank") } } }.orEmpty()
+                val adult = if (hasAdultContentLabels(genres, tags) || row.optBoolean("isAdult")) true else if (row.has("isAdult") && !row.isNull("isAdult")) false else null
+                AniIdentity(row.optInt("id"), row.optString("format"), title.optString("romaji"), aliases.filter { it.isNotBlank() && it != "null" }, adult)
             } }
             identities.also { aniCache[cacheKey] = it }
         } finally { request.disconnect() }
     }
 
     private suspend fun resolveSingle(anime: Anime, episode: Episode, dubbed: Boolean, openSubtitlesEnabled: Boolean, openSubtitlesApiKey: String): PlaybackSource = withContext(Dispatchers.IO) {
-        if (anime.slug.startsWith("https://animesdrive.cloud/") || anime.slug.startsWith("https://goyabu.io/")) return@withContext externalPlayback(anime, episode)
+        if (anime.slug.startsWith("https://animesdrive.cloud/")) return@withContext externalPlayback(anime, episode)
         if (anime.slug.startsWith("hi:")) return@withContext hi.resolve(anime.copy(slug = anime.slug.removePrefix("hi:")), episode, dubbed, openSubtitlesEnabled, openSubtitlesApiKey)
         if (anime.slug.startsWith("https://animesdigital.org/")) return@withContext digitalPlayback(anime, episode, dubbed)
         val data = org.json.JSONObject(fetch("$FIRE_BASE/episode/${episode.id}?v=3", "https://animefire.one/")).getJSONObject("data")
@@ -299,30 +313,15 @@ class AnimeRepository {
         return PlaybackSource(url, null, "https://animesdigital.org/", anime.title, episode.number, if (isDubbed) "Dublado" else "Áudio original", if (isDubbed) "Dublado" else "Legenda da fonte")
     }
 
-    private fun externalSearch(query: String, base: String, goyabu: Boolean): List<Anime> {
+    private fun externalSearch(query: String, base: String): List<Anime> {
         val encoded = URLEncoder.encode(query, Charsets.UTF_8.name())
-        if (goyabu) {
-            val homepage = fetch("$base/", "$base/")
-            val nonce = Regex("\"nonce\"\\s*:\\s*\"([a-f0-9]+)\"").find(homepage)?.groupValues?.get(1)
-            if (nonce != null) {
-                val json = runCatching { org.json.JSONObject(fetch("$base/wp-json/animeonline/search/?keyword=$encoded&nonce=$nonce", "$base/")) }.getOrNull()
-                if (json != null) {
-                    val items = json.keys().asSequence().mapNotNull { json.optJSONObject(it) }.mapNotNull { item ->
-                        val url = runCatching { URI(base).resolve(item.optString("url")) }.getOrNull(); val title = item.optString("title")
-                        if (url?.host != URI(base).host || url.scheme != "https" || title.isBlank()) null else Anime(url.toString(), title, item.optString("img"), metadata = listOf("Goyabu"))
-                    }.toList()
-                    if (items.isNotEmpty()) return items
-                }
-            }
-        }
         val doc = Jsoup.parse(fetch("$base/?s=$encoded", "$base/"), base)
-        val selector = if (goyabu) "article a[href], .anime-item a[href], .post a[href]" else "div.result-item article, article.w_item_a, article.item"
-        return doc.select(selector).mapNotNull { card ->
-            val link = if (goyabu) card else card.selectFirst("div.title a[href], div.details .title a[href], a[href]") ?: return@mapNotNull null
+        return doc.select("div.result-item article, article.w_item_a, article.item").mapNotNull { card ->
+            val link = card.selectFirst("div.title a[href], div.details .title a[href], a[href]") ?: return@mapNotNull null
             val url = link.absUrl("href"); val uri = runCatching { URI(url) }.getOrNull()
             if (uri?.host != URI(base).host || uri.scheme != "https" || !uri.path.contains("/anime/")) return@mapNotNull null
-            val title = if (goyabu) card.selectFirst("h3, h2")?.text().orEmpty().ifBlank { card.selectFirst("img")?.attr("alt").orEmpty() } else card.selectFirst("div.title a, div.details .title a")?.text().orEmpty().ifBlank { card.selectFirst("h3,h2")?.text().orEmpty() }.ifBlank { card.selectFirst("img")?.attr("alt").orEmpty() }
-            if (title.isBlank()) null else Anime(url, title, card.selectFirst("img")?.absUrl("src").orEmpty(), metadata = listOf(if (goyabu) "Goyabu" else "AnimeDrive"))
+            val title = card.selectFirst("div.title a, div.details .title a")?.text().orEmpty().ifBlank { card.selectFirst("h3,h2")?.text().orEmpty() }.ifBlank { card.selectFirst("img")?.attr("alt").orEmpty() }
+            if (title.isBlank()) null else Anime(url, title, card.selectFirst("img")?.absUrl("src").orEmpty(), metadata = listOf("AnimeDrive"))
         }.distinctBy { it.slug }.take(30)
     }
 
@@ -334,12 +333,7 @@ class AnimeRepository {
     }
 
     private fun externalEpisodes(anime: Anime): List<Episode> {
-        val html = fetch(anime.slug); val doc = Jsoup.parse(html, anime.slug)
-        if (anime.slug.startsWith("https://goyabu.io/")) {
-            val raw = Regex("(?:allEpisodes|episodes|episodeList|episodios)\\s*[:=]\\s*(\\[[\\s\\S]*?\\])").find(html)?.groupValues?.get(1)
-            val array = raw?.let { runCatching { org.json.JSONArray(it) }.getOrNull() }
-            if (array != null) return (0 until array.length()).mapNotNull { i -> array.optJSONObject(i)?.let { item -> val id = item.optString("id"); val n = item.optString("episodio").ifBlank { "${i + 1}" }; if (id.isBlank()) null else Episode("https://goyabu.io/?p=$id", n, "Episódio $n") } }.sortedBy { it.number.toDoubleOrNull() ?: Double.MAX_VALUE }
-        }
+        val doc = Jsoup.parse(fetch(anime.slug), anime.slug)
         val links = doc.select(".episode-info .episode-title a[href], .episode-card a[href], #seasons .episodios li a[href], .episodios li a[href], .se-a a[href], #episodes a[href], .episodelist a[href]")
         return links.mapNotNull { link -> val url = link.absUrl("href"); val uri = runCatching { URI(url) }.getOrNull(); if (uri?.host != URI(anime.slug).host || uri.scheme != "https" || !url.contains("episodio", true)) return@mapNotNull null; val n = Regex("(?i)episodios?[-_]?([0-9]+)").find(url)?.groupValues?.get(1) ?: Regex("[0-9]+").find(link.text())?.value ?: return@mapNotNull null; Episode(url, n, link.text().ifBlank { "Episódio $n" }) }.distinctBy { it.id }.sortedBy { it.number.toIntOrNull() ?: Int.MAX_VALUE }
     }
@@ -358,6 +352,24 @@ class AnimeRepository {
             fetch("$FIRE_BASE/anime/$id?v=3", "https://animefire.one/").also { org.json.JSONObject(it).getJSONObject("data") }
         }
         return org.json.JSONObject(json).getJSONObject("data")
+    }
+
+    private fun verifyFireAudio(episodes: org.json.JSONArray?): Set<String> {
+        if (episodes == null) return emptySet()
+        val ids = (episodes.length() - 1 downTo 0).mapNotNull { episodes.optJSONObject(it)?.optString("id")?.takeIf(String::isNotBlank) }.distinct().take(2)
+        val confirmed = mutableSetOf<String>()
+        for (id in ids) {
+            val streams = runCatching { org.json.JSONObject(fetch("$FIRE_BASE/episode/$id?v=3", "https://animefire.one/")).optJSONObject("data")?.optJSONArray("streams") }.getOrNull() ?: continue
+            for (index in 0 until streams.length()) {
+                val stream = streams.optJSONObject(index) ?: continue
+                if (!stream.optBoolean("is_offline") && stream.optString("url").startsWith("https://")) {
+                    val audio = stream.optString("audio").lowercase(java.util.Locale.ROOT)
+                    if (audio == "dublado" || audio == "legendado") confirmed.add(audio)
+                }
+            }
+            if (confirmed.size == 2) break
+        }
+        return confirmed
     }
 
     private fun fireCatalog(url: String): List<Anime> {

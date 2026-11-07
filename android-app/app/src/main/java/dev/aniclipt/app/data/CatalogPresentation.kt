@@ -1,19 +1,23 @@
 package dev.aniclipt.app.data
 
-/** Only label information explicitly provided by a catalog; unknown languages remain unknown. */
+/** Only label audio modes confirmed by a playable stream, never catalog claims or alternatives. */
 internal fun catalogTags(anime: Anime): List<String> {
-    val raw = (listOf(anime) + anime.alternatives).flatMap { it.metadata }.joinToString(" ").lowercase(java.util.Locale.ROOT)
     val tags = mutableListOf<String>()
-    if (Regex("\\b(dublado|dubbed|dub)\\b").containsMatchIn(raw)) tags.add("Dublado")
-    if (Regex("\\b(legendado|subbed|sub)\\b").containsMatchIn(raw)) tags.add("Legendado")
-    if (Regex("\\b(original|japones|japonês)\\b").containsMatchIn(raw)) tags.add("Áudio original")
-    if (Regex("\\b(pt-br|pt_br|portugu[eê]s)\\b").containsMatchIn(raw)) tags.add("PT-BR informado")
-    if (Regex("\\b(english|ingl[eê]s)\\b").containsMatchIn(raw)) tags.add("Inglês informado")
+    if ("dublado" in anime.confirmedAudio) tags.add("Dublado")
+    if ("legendado" in anime.confirmedAudio) tags.add("Legendado")
     return tags.distinct()
 }
 
 internal fun showInCatalog(anime: Anime, hideAdult: Boolean): Boolean =
-    anime.availability != Availability.EMPTY && (!hideAdult || anime.isAdult != true)
+    anime.availability != Availability.EMPTY && (!hideAdult || anime.isAdult != true && !knownSuggestiveTitle(anime.title))
+
+/** Explicit sexual-content labels; broad genres such as romance and harem are not enough. */
+internal fun hasAdultContentLabels(genres: List<String>, tags: List<Pair<String, Int>> = emptyList()): Boolean =
+    genres.any { it.trim().lowercase(java.util.Locale.ROOT) in setOf("ecchi", "hentai") } ||
+        tags.any { (name, rank) -> name.equals("nudity", ignoreCase = true) && rank >= 75 }
+
+private fun knownSuggestiveTitle(title: String): Boolean =
+    matchingTitle(title, null) == "mayoi neko overrun"
 
 /** An episode list does not guarantee that its video streams are currently playable. */
 internal fun availabilityFromEpisodeCount(count: Int?, hasAlternatives: Boolean): Availability = when {

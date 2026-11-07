@@ -4,14 +4,14 @@ import org.junit.Assert.*
 import org.junit.Test
 
 class CatalogPresentationTest {
-    @Test fun onlyReportsAudioOrLanguageWhenIndicated() {
-        assertEquals(listOf("Dublado", "Legendado"), catalogTags(Anime("a", "Anime", metadata = listOf("Dublado & Legendado"))))
+    @Test fun onlyReportsAudioConfirmedByAnActiveStream() {
+        assertEquals(listOf("Dublado", "Legendado"), catalogTags(Anime("a", "Anime", confirmedAudio = setOf("dublado", "legendado"))))
         assertEquals(emptyList<String>(), catalogTags(Anime("a", "Anime", metadata = listOf("HiAnime"))))
-        assertEquals(listOf("Legendado", "Inglês informado"), catalogTags(Anime("a", "Anime", metadata = listOf("SUB", "English"))))
+        assertEquals(emptyList<String>(), catalogTags(Anime("a", "Anime", metadata = listOf("Dublado & Legendado"))))
     }
-    @Test fun includesKnownFormatsFromOtherMatchedSources() {
-        val item = Anime("a", "Anime", metadata = listOf("SUB"), alternatives = listOf(Anime("b", "Anime", metadata = listOf("Dublado"))))
-        assertEquals(listOf("Dublado", "Legendado"), catalogTags(item))
+    @Test fun doesNotBorrowAudioClaimsFromUnverifiedAlternatives() {
+        val item = Anime("a", "Anime", confirmedAudio = setOf("legendado"), alternatives = listOf(Anime("b", "Anime", metadata = listOf("Dublado"))))
+        assertEquals(listOf("Legendado"), catalogTags(item))
     }
     @Test fun anyConfirmedAdultSourceProtectsTheGroupedResult() {
         assertEquals(true, aggregateAdultFlags(listOf(Anime("a", "Anime"), Anime("b", "Anime", isAdult = true))))
@@ -45,5 +45,18 @@ class CatalogPresentationTest {
         assertTrue(showInCatalog(Anime("a", "Anime", isAdult = true), false))
         assertFalse(showInCatalog(Anime("a", "Anime", availability = Availability.EMPTY), false))
         assertTrue(showInCatalog(Anime("a", "Anime", availability = Availability.UNKNOWN), false))
+    }
+    @Test fun usesExplicitGenresAndStrongNudityTagsWithoutBlockingBroadGenres() {
+        assertTrue(hasAdultContentLabels(listOf("Ecchi")))
+        assertTrue(hasAdultContentLabels(listOf("Hentai")))
+        assertTrue(hasAdultContentLabels(listOf("Romance"), listOf("Nudity" to 93)))
+        assertFalse(hasAdultContentLabels(listOf("Harém", "Romance", "Comédia")))
+        assertFalse(hasAdultContentLabels(listOf("Action"), listOf("Nudity" to 35)))
+    }
+    @Test fun handlesKnownUnlabeledSuggestiveTitleWithoutMatchingSimilarNames() {
+        assertFalse(showInCatalog(Anime("a", "Mayoi Neko Overrun!"), true))
+        assertFalse(showInCatalog(Anime("a", "Mayoi Neko Overrun"), true))
+        assertTrue(showInCatalog(Anime("b", "Mayoi Neko Overrun: Another Story"), true))
+        assertTrue(showInCatalog(Anime("c", "Mayoi Neko Overrun!"), false))
     }
 }
