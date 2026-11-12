@@ -18,42 +18,52 @@ import androidx.work.WorkManager
 import androidx.work.WorkerParameters
 import dev.aniclipt.app.data.Anime
 import dev.aniclipt.app.data.AnimeRepository
+import dev.aniclipt.app.data.IdentityRegistry
+import dev.aniclipt.app.data.local.AppDatabase
+import dev.aniclipt.app.data.local.LegacyDataMigration
+import dev.aniclipt.app.data.local.LocalAnimeStore
+import dev.aniclipt.app.data.local.UserPreferencesStore
+import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.withContext
-import org.json.JSONArray
 import java.util.concurrent.TimeUnit
 
 class FavoriteEpisodeWorker(context: Context, params: WorkerParameters) : CoroutineWorker(context, params) {
     override suspend fun doWork(): Result = withContext(Dispatchers.IO) {
-        val prefs = applicationContext.getSharedPreferences("ani-cli-pt", Context.MODE_PRIVATE)
-        if (!prefs.getBoolean("episode_notifications", false)) return@withContext Result.success()
-        val favorites = runCatching {
-            val array = JSONArray(prefs.getString("favorite_items", "[]"))
-            (0 until array.length()).map { index ->
-                val item = array.getJSONObject(index)
-                Anime(item.getString("slug"), item.getString("title"), item.optString("poster"), synopsis = item.optString("synopsis"))
-            }
-        }.getOrDefault(emptyList())
+        val preferences = UserPreferencesStore(applicationContext)
+        preferences.migrateLegacyIfNeeded()
+        if (!preferences.current().episodeNotifications) return@withContext Result.success()
+        val database = AppDatabase.get(applicationContext)
+        LegacyDataMigration(applicationContext, database).migrateIfNeeded()
+        val dao = database.appDao()
+        val store = LocalAnimeStore(database)
+        val favorites = dao.favorites().filterNot { item ->
+            item.slug == item.releaseId && UUID_PATTERN.matches(item.slug)
+        }.map { item ->
+            Anime(item.slug, item.title, item.poster, synopsis = item.synopsis, anilistId = item.anilistId,
+                isAdult = item.isAdult, workId = item.workId, releaseId = item.releaseId)
+        }
         if (favorites.isEmpty()) return@withContext Result.success()
 
         val notificationsAllowed = Build.VERSION.SDK_INT < 33 || applicationContext.checkSelfPermission(Manifest.permission.POST_NOTIFICATIONS) == PackageManager.PERMISSION_GRANTED
         var hadFailure = false
-        val repository = AnimeRepository()
+        val identities = IdentityRegistry(database = database).also { it.bootstrap() }
+        val repository = AnimeRepository(identities, database)
         favorites.forEach { anime ->
-            val result = runCatching { repository.episodes(anime) }
+            val result = try { kotlin.Result.success(repository.episodes(anime)) }
+                catch (cancelled: CancellationException) { throw cancelled }
+                catch (failure: Exception) { kotlin.Result.failure(failure) }
             result.onFailure { hadFailure = true }
             result.onSuccess { episodes ->
-                val key = "episode_snapshot:${anime.slug}"
                 val current = episodes.map { it.id }.toSet()
-                val previousRaw = prefs.getString(key, null)
-                val previous = runCatching { JSONArray(previousRaw ?: "[]").let { array -> (0 until array.length()).map { array.getString(it) }.toSet() } }.getOrDefault(emptySet())
-                if (previousRaw != null && notificationsAllowed) {
-                    val fresh = episodes.filter { it.id !in previous }
-                    if (fresh.isNotEmpty()) postNotification(anime, fresh.size, fresh.first().number)
+                val freshIds = store.replaceFavoriteEpisodeSnapshot(anime.slug, current)
+                if (freshIds.isNotEmpty() && notificationsAllowed) {
+                    val fresh = episodes.filter { it.id in freshIds }
+                    postNotification(anime, fresh.size, fresh.first().number)
                 }
-                prefs.edit().putString(key, JSONArray(current.toList()).toString()).apply()
             }
         }
+        identities.awaitPersisted()
         if (hadFailure) Result.retry() else Result.success()
     }
 
@@ -81,6 +91,7 @@ class FavoriteEpisodeWorker(context: Context, params: WorkerParameters) : Corout
     }
 
     companion object {
+        private val UUID_PATTERN = Regex("[0-9a-fA-F]{8}(?:-[0-9a-fA-F]{4}){3}-[0-9a-fA-F]{12}")
         private const val CHANNEL_ID = "favorite-episodes"
         private const val UNIQUE_WORK = "favorite-episode-check"
 

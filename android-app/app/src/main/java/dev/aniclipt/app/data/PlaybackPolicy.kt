@@ -1,5 +1,14 @@
 package dev.aniclipt.app.data
 
+/** A verified primary stream can start without searching every fallback provider. */
+internal fun canPlayPrimaryImmediately(source: PlaybackSource, dubbed: Boolean): Boolean {
+    if (dubbed) return source.audioLabel.contains("Dublado", true) && !source.audioLabel.contains("indisponível", true)
+    if (source.audioLabel.contains("Dublado", true)) return false
+    val subtitle = source.subtitleLabel
+    return subtitle.contains("PT-BR", true) && !subtitle.contains("Sem PT-BR", true) ||
+        subtitle == "Legenda da fonte" && (source.providerSlug.contains("animesdigital.org") || source.providerSlug.contains("#s"))
+}
+
 /** Selects a source without knowing how providers perform their requests. */
 internal suspend fun choosePlaybackSource(
     dubbed: Boolean,

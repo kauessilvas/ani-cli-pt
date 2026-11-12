@@ -3,7 +3,6 @@ package dev.aniclipt.app.data
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.withContext
 import org.json.JSONObject
-import java.net.HttpURLConnection
 import java.net.URL
 
 data class SkipInterval(val type: String, val startMs: Long, val endMs: Long) {
@@ -56,26 +55,18 @@ class AniSkipRepository {
     }
 
     private fun graphql(query: String, variables: JSONObject): JSONObject {
-        val connection = URL("https://graphql.anilist.co").openConnection() as HttpURLConnection
-        connection.requestMethod = "POST"
-        connection.doOutput = true
-        connection.connectTimeout = 8_000
-        connection.readTimeout = 10_000
-        connection.setRequestProperty("Content-Type", "application/json")
-        try {
-            connection.outputStream.bufferedWriter().use { it.write(JSONObject().put("query", query).put("variables", variables).toString()) }
-            if (connection.responseCode !in 200..299) return JSONObject()
-            return JSONObject(connection.inputStream.bufferedReader().use { it.readText() })
-        } finally { connection.disconnect() }
+        return HttpTransport.execute(
+            url = "https://graphql.anilist.co", method = "POST",
+            body = JSONObject().put("query", query).put("variables", variables).toString(),
+            connectTimeoutMillis = 8_000, readTimeoutMillis = 10_000,
+        ).use { response ->
+            if (!response.isSuccessful) JSONObject() else JSONObject(response.body?.string().orEmpty())
+        }
     }
 
     private fun fetch(url: String): String {
-        val connection = URL(url).openConnection() as HttpURLConnection
-        connection.connectTimeout = 8_000
-        connection.readTimeout = 10_000
-        try {
-            if (connection.responseCode !in 200..299) return "{}"
-            return connection.inputStream.bufferedReader().use { it.readText() }
-        } finally { connection.disconnect() }
+        return HttpTransport.execute(url, connectTimeoutMillis = 8_000, readTimeoutMillis = 10_000).use { response ->
+            if (!response.isSuccessful) "{}" else response.body?.string().orEmpty()
+        }
     }
 }

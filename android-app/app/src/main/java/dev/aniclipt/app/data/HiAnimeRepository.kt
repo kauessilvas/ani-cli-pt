@@ -9,18 +9,30 @@ import kotlinx.coroutines.withContext
 import kotlinx.coroutines.sync.Semaphore
 import kotlinx.coroutines.sync.withPermit
 import org.jsoup.Jsoup
-import java.net.HttpURLConnection
 import java.net.URI
 import java.net.URL
 import java.net.URLEncoder
 
+internal data class VerifiedArtwork(val poster: String, val banner: String)
+
 class HiAnimeRepository {
     private val titleTranslationSemaphore = Semaphore(3)
+    private val detailPageCache = TimedRequestCache<String, String>(maxEntries = 32, ttlMillis = 10 * 60_000L, shouldCache = String::isNotBlank)
+    private data class TmdbMatch(val id: Int, val artwork: VerifiedArtwork, val overview: String)
+    private val tmdbMatchCache = TimedRequestCache<String, TmdbMatch?>(maxEntries = 128, ttlMillis = 60 * 60_000L, shouldCache = { it != null })
+    private val tmdbSeasonCache = TimedRequestCache<String, List<EpisodeMetadata>>(maxEntries = 64, ttlMillis = 60 * 60_000L, shouldCache = { it.isNotEmpty() })
+    private val tmdbPosterCache = TimedRequestCache<String, String>(maxEntries = 64, ttlMillis = 60 * 60_000L, shouldCache = String::isNotBlank)
+
+    private suspend fun detailPage(slug: String): String = detailPageCache.getOrLoad(slug) { fetch("$BASE/$slug") }
 
     fun searchAliases(query: String): List<String> = titleSearchAliases[normalizeMatchText(query)].orEmpty()
 
     suspend fun airing(): List<Anime> = withContext(Dispatchers.IO) {
         parseCatalog(fetch("$BASE/top-airing"))
+    }
+
+    suspend fun popular(): List<Anime> = withContext(Dispatchers.IO) {
+        parseCatalog(fetch("$BASE/most-popular"))
     }
 
     suspend fun search(query: String): List<Anime> = withContext(Dispatchers.IO) {
@@ -38,23 +50,16 @@ class HiAnimeRepository {
 
     suspend fun validateOpenSubtitlesApiKey(apiKey: String): Boolean? = withContext(Dispatchers.IO) {
         if (apiKey.isBlank()) return@withContext false
-        val request = runCatching { URL("$OPEN_SUBTITLES_BASE/infos/formats").openConnection() as HttpURLConnection }.getOrNull()
-            ?: return@withContext null
-        request.connectTimeout = 10_000
-        request.readTimeout = 10_000
-        request.setRequestProperty("Api-Key", apiKey)
-        request.setRequestProperty("Accept", "application/json")
-        request.setRequestProperty("User-Agent", OPEN_SUBTITLES_USER_AGENT)
         try {
-            when (request.responseCode) {
+            HttpTransport.execute("$OPEN_SUBTITLES_BASE/infos/formats", mapOf(
+                "Api-Key" to apiKey, "Accept" to "application/json", "User-Agent" to OPEN_SUBTITLES_USER_AGENT,
+            ), connectTimeoutMillis = 10_000, readTimeoutMillis = 10_000).use { response -> when (response.code) {
                 in 200..299 -> true
                 401, 403 -> false
                 else -> null
-            }
+            } }
         } catch (_: Exception) {
             null
-        } finally {
-            request.disconnect()
         }
     }
 
@@ -78,8 +83,34 @@ class HiAnimeRepository {
         episode.copy(title = translated, originalTitle = original)
     }
 
+    internal suspend fun findTmdbArtwork(anime: Anime): VerifiedArtwork? = findTmdbMatch(anime)?.let { verifiedArtwork(it, anime) }
+
+    private suspend fun verifiedArtwork(match: TmdbMatch, anime: Anime): VerifiedArtwork {
+        val season = explicitSeason(anime.title, anime.slug) ?: return match.artwork
+        if (season <= 1) return match.artwork
+        val poster = runCatching { tmdbPosterCache.getOrLoad("${match.id}:$season") {
+            val key = TMDB_KEY_BYTES.map { (it xor 83).toChar() }.joinToString("")
+            val apiKey = URLEncoder.encode(key, Charsets.UTF_8.name())
+            val row = org.json.JSONObject(fetch("https://api.themoviedb.org/3/tv/${match.id}/season/$season?api_key=$apiKey&language=pt-BR", "https://www.themoviedb.org/"))
+            row.optString("poster_path").takeIf { it.startsWith("/") && !it.startsWith("//") }?.let { "https://image.tmdb.org/t/p/w780$it" }.orEmpty()
+        } }.getOrDefault("")
+        return VerifiedArtwork(poster, match.artwork.banner)
+    }
+
+    internal suspend fun enrichEpisodes(anime: Anime, episodes: List<Episode>): List<Episode> = withContext(Dispatchers.IO) {
+        if (isFinalSeason(anime.title) || explicitFormat(anime.title, anime.metadata) == "MOVIE") return@withContext episodes
+        val match = findTmdbMatch(anime) ?: return@withContext episodes
+        val season = explicitSeason(anime.title, anime.slug) ?: 1
+        val english = runCatching { tmdbSeasonEpisodes(match.id, season, "en-US") }.getOrDefault(emptyList())
+        val portuguese = runCatching { tmdbSeasonEpisodes(match.id, season, "pt-BR") }.getOrDefault(emptyList())
+        val enByNumber = english.associateBy { it.number }
+        mergeVerifiedEpisodeMetadata(episodes, english, portuguese.map { item ->
+            item.copy(still = item.still.ifBlank { enByNumber[item.number]?.still.orEmpty() })
+        })
+    }
+
     suspend fun seasons(anime: Anime): List<Anime> = withContext(Dispatchers.IO) {
-        val doc = Jsoup.parse(fetch("$BASE/${anime.slug}"))
+        val doc = Jsoup.parse(detailPage(anime.slug))
         val relatedSection = doc.select("section").firstOrNull { section ->
             section.selectFirst(".cat-heading")?.text()?.contains("Related Anime", ignoreCase = true) == true
         }
@@ -93,24 +124,27 @@ class HiAnimeRepository {
             val metadata = detail?.select(".fdi-item")?.map { it.text() }.orEmpty().ifEmpty { listOf("TV") }
             Anime(slug, title, metadata = metadata)
         }
-        val base = seasonFamily(anime.title)
+        val base = seasonFamilyKey(anime.title)
         (listOf(anime) + related)
             .distinctBy { it.slug }
-            .filter { candidate -> seasonFamily(candidate.title) == base }
-            .sortedWith(compareBy<Anime> { seasonNumber(it.title) ?: 1 }.thenBy { it.slug })
+            .filter { candidate -> seasonFamilyKey(candidate.title) == base }
+            .sortedWith(compareBy<Anime> { seasonOrder(it).first }.thenBy { seasonOrder(it).second }.thenBy { seasonOrder(it).third }.thenBy { it.slug })
     }
 
     suspend fun artwork(anime: Anime): Anime = withContext(Dispatchers.IO) {
-        val doc = runCatching { Jsoup.parse(fetch("$BASE/${anime.slug}")) }.getOrElse { Jsoup.parse("") }
+        val doc = runCatching { Jsoup.parse(detailPage(anime.slug)) }.getOrElse { Jsoup.parse("") }
         val bannerStyle = doc.selectFirst(".anis-cover")?.attr("style").orEmpty()
         val banner = Regex("url\\(['\\\"]?(.*?)['\\\"]?\\)").find(bannerStyle)?.groupValues?.get(1)?.let { URI("$BASE/").resolve(it).toString() }.orEmpty()
         val poster = doc.selectFirst("img.film-poster-img")?.let { it.attr("data-src").ifBlank { it.attr("src") } }.orEmpty()
         val synopsis = doc.selectFirst(".film-description .text, .film-description, .description")?.text()?.take(500).orEmpty()
         val sourceText = synopsis.ifBlank { anime.synopsis }.takeUnless { it.equals("null", true) || it.equals("undefined", true) }.orEmpty()
-        val localized = findTmdbSynopsis(anime) ?: sourceText.takeIf { it.isNotBlank() }?.let { text ->
+        val match = findTmdbMatch(anime)
+        val verified = match?.let { verifiedArtwork(it, anime) }
+        val localized = match?.overview?.takeIf(String::isNotBlank) ?: findTmdbSynopsis(anime) ?: sourceText.takeIf { it.isNotBlank() }?.let { text ->
             translatePtBr(text).takeUnless { it.equals(text, ignoreCase = true) }
         }.orEmpty()
-        anime.copy(banner = banner, poster = poster.ifBlank { anime.poster }, synopsis = localized)
+        anime.copy(banner = verified?.banner.orEmpty().ifBlank { banner }.ifBlank { anime.banner },
+            poster = verified?.poster.orEmpty().ifBlank { poster }.ifBlank { anime.poster }, synopsis = localized)
     }
 
     suspend fun resolve(anime: Anime, episode: Episode, dubbed: Boolean, openSubtitlesEnabled: Boolean, openSubtitlesApiKey: String): PlaybackSource = withContext(Dispatchers.IO) {
@@ -263,50 +297,37 @@ class HiAnimeRepository {
     }
 
     private fun requestSubtitleDownload(fileId: Int, apiKey: String): ExternalSubtitle? {
-        val request = URL("$OPEN_SUBTITLES_BASE/download").openConnection() as HttpURLConnection
-        request.requestMethod = "POST"
-        request.connectTimeout = 12_000
-        request.readTimeout = 20_000
-        request.doOutput = true
-        request.setRequestProperty("Api-Key", apiKey)
-        request.setRequestProperty("Content-Type", "application/json")
-        request.setRequestProperty("Accept", "application/json")
-        request.setRequestProperty("User-Agent", OPEN_SUBTITLES_USER_AGENT)
-        return try {
-            request.outputStream.bufferedWriter(Charsets.UTF_8).use { it.write("{\"file_id\":$fileId,\"sub_format\":\"srt\"}") }
-            val code = request.responseCode
-            val body = (if (code in 200..299) request.inputStream else request.errorStream)?.bufferedReader(Charsets.UTF_8)?.use { it.readText() }.orEmpty()
+        return HttpTransport.execute("$OPEN_SUBTITLES_BASE/download", mapOf(
+            "Api-Key" to apiKey, "Accept" to "application/json", "User-Agent" to OPEN_SUBTITLES_USER_AGENT,
+        ), method = "POST", body = "{\"file_id\":$fileId,\"sub_format\":\"srt\"}",
+            connectTimeoutMillis = 12_000, readTimeoutMillis = 20_000).use { response ->
+            val code = response.code
+            val body = response.body?.string().orEmpty()
             if (code !in 200..299) throw OpenSubtitlesApiException(code)
             val link = org.json.JSONObject(body).optString("link").takeIf { it.startsWith("https://") } ?: return null
             ExternalSubtitle(link, fetchSubtitleDuration(link))
-        } finally {
-            request.disconnect()
         }
     }
 
     private fun fetchSubtitleDuration(url: String): Double? {
-        val request = runCatching { URL(url).openConnection() as HttpURLConnection }.getOrNull() ?: return null
-        request.connectTimeout = 10_000
-        request.readTimeout = 12_000
-        request.setRequestProperty("Accept", "text/plain, */*")
-        request.setRequestProperty("User-Agent", OPEN_SUBTITLES_USER_AGENT)
         val cuePattern = Regex("(\\d{2}:\\d{2}:\\d{2}[,.]\\d{3})\\s*-->\\s*(\\d{2}:\\d{2}:\\d{2}[,.]\\d{3})")
         return try {
             var consumedCharacters = 0
             var lastEnd: Double? = null
-            request.inputStream.bufferedReader(Charsets.UTF_8).useLines { lines ->
+            HttpTransport.execute(url, mapOf("Accept" to "text/plain, */*", "User-Agent" to OPEN_SUBTITLES_USER_AGENT),
+                connectTimeoutMillis = 10_000, readTimeoutMillis = 12_000).use { response ->
+            if (!response.isSuccessful) return null
+            response.body?.charStream()?.useLines { lines ->
                 lines.forEach { line ->
                     consumedCharacters += line.length
                     if (consumedCharacters > MAX_SUBTITLE_INSPECTION_CHARACTERS) return@useLines
                     val times = cuePattern.find(line)?.groupValues ?: return@forEach
                     lastEnd = timestampSeconds(times[2])
                 }
-            }
+            } }
             lastEnd
         } catch (_: Exception) {
             null
-        } finally {
-            request.disconnect()
         }
     }
 
@@ -361,18 +382,12 @@ class HiAnimeRepository {
     }
 
     private fun openSubtitlesRequest(url: String, apiKey: String): org.json.JSONObject {
-        val request = URL(url).openConnection() as HttpURLConnection
-        request.connectTimeout = 12_000
-        request.readTimeout = 20_000
-        request.setRequestProperty("Api-Key", apiKey)
-        request.setRequestProperty("Accept", "application/json")
-        request.setRequestProperty("User-Agent", OPEN_SUBTITLES_USER_AGENT)
-        return try {
-            val code = request.responseCode
-            val body = (if (code in 200..299) request.inputStream else request.errorStream)?.bufferedReader(Charsets.UTF_8)?.use { it.readText() }.orEmpty()
+        return HttpTransport.execute(url, mapOf(
+            "Api-Key" to apiKey, "Accept" to "application/json", "User-Agent" to OPEN_SUBTITLES_USER_AGENT,
+        ), connectTimeoutMillis = 12_000, readTimeoutMillis = 20_000).use { response ->
+            val code = response.code
+            val body = response.body?.string().orEmpty()
             if (code !in 200..299) throw OpenSubtitlesApiException(code) else org.json.JSONObject(body)
-        } finally {
-            request.disconnect()
         }
     }
 
@@ -384,8 +399,52 @@ class HiAnimeRepository {
             if (slug.isBlank() || title.isBlank()) return@mapNotNull null
             val image = card.selectFirst("img.film-poster-img")
             val poster = image?.attr("data-src").orEmpty().ifBlank { image?.attr("src").orEmpty() }
-            Anime(slug, title, poster, synopsis = card.selectFirst(".description")?.text().orEmpty().take(500), metadata = card.select(".fdi-item").map { it.text() }.take(4))
+            Anime(slug, title, poster, synopsis = card.selectFirst(".description")?.text().orEmpty().take(500), metadata = card.select(".fdi-item").map { it.text() }.take(4), isAdult = if (card.text().contains("18+")) true else null)
         }.distinctBy { it.slug }.take(36)
+
+    private suspend fun findTmdbMatch(anime: Anime): TmdbMatch? {
+        val format = explicitFormat(anime.title, anime.metadata)
+        val cacheKey = "${normalizeMatchText(anime.title)}:${format ?: "?"}"
+        return tmdbMatchCache.getOrLoad(cacheKey) {
+            val key = TMDB_KEY_BYTES.map { (it xor 83).toChar() }.joinToString("")
+            val baseTitle = anime.title.substringBefore(" · Temporada").replace(
+                Regex("(?i)\\s*(?:[-:·]\\s*)?(?:season|temporada)\\s*\\d+\\s*$|\\s+\\d+(?:st|nd|rd|th)\\s+season\\s*$"), ""
+            ).trim().ifBlank { anime.title }
+            val query = URLEncoder.encode(baseTitle, Charsets.UTF_8.name())
+            val apiKey = URLEncoder.encode(key, Charsets.UTF_8.name())
+            val formats = when (format) { "MOVIE" -> listOf("movie"); "TV" -> listOf("tv"); else -> listOf("tv", "movie") }
+            val candidates = formats.flatMap { kind ->
+                val rows = runCatching { org.json.JSONObject(fetch("https://api.themoviedb.org/3/search/$kind?api_key=$apiKey&language=pt-BR&include_adult=false&query=$query", "https://www.themoviedb.org/"))
+                    .optJSONArray("results") }.getOrNull()
+                (0 until (rows?.length() ?: 0)).mapNotNull { index ->
+                    val row = rows?.optJSONObject(index) ?: return@mapNotNull null
+                    val id = row.optInt("id").takeIf { it > 0 } ?: return@mapNotNull null
+                    val names = if (kind == "movie") listOf(row.optString("title"), row.optString("original_title"))
+                        else listOf(row.optString("name"), row.optString("original_name"))
+                    val score = identityScore(baseTitle, if (kind == "movie") "MOVIE" else "TV", names, format) ?: return@mapNotNull null
+                    fun imagePath(field: String, size: String): String = row.optString(field)
+                        .takeIf { it.startsWith("/") && !it.startsWith("//") }?.let { "https://image.tmdb.org/t/p/$size$it" }.orEmpty()
+                    TmdbMatch(id, VerifiedArtwork(imagePath("poster_path", "w780"), imagePath("backdrop_path", "w1280")), cleanSynopsis(row.optString("overview"))) to score
+                }
+            }.sortedByDescending { it.second }
+            candidates.firstOrNull()?.takeIf { candidates.size == 1 || candidates[0].second - candidates[1].second >= .12 }?.first
+        }
+    }
+
+    private suspend fun tmdbSeasonEpisodes(id: Int, season: Int, locale: String): List<EpisodeMetadata> =
+        tmdbSeasonCache.getOrLoad("$id:$season:$locale") {
+            val key = TMDB_KEY_BYTES.map { (it xor 83).toChar() }.joinToString("")
+            val apiKey = URLEncoder.encode(key, Charsets.UTF_8.name())
+            val data = org.json.JSONObject(fetch("https://api.themoviedb.org/3/tv/$id/season/$season?api_key=$apiKey&language=$locale", "https://www.themoviedb.org/"))
+            val rows = data.optJSONArray("episodes")
+            (0 until (rows?.length() ?: 0)).mapNotNull { index ->
+                val row = rows?.optJSONObject(index) ?: return@mapNotNull null
+                val number = row.optInt("episode_number").takeIf { it > 0 } ?: return@mapNotNull null
+                val still = row.optString("still_path").takeIf { it.startsWith("/") && !it.startsWith("//") }
+                    ?.let { "https://image.tmdb.org/t/p/w780$it" }.orEmpty()
+                EpisodeMetadata(number, row.optString("name"), still)
+            }
+        }
 
     fun findTmdbSynopsis(anime: Anime): String? {
         val key = TMDB_KEY_BYTES.map { (it xor 83).toChar() }.joinToString("")
@@ -449,19 +508,6 @@ class HiAnimeRepository {
         }.getOrElse { text }
     }
 
-    private fun seasonFamily(title: String): String = title.lowercase()
-        .replace(Regex("\\bthe\\s+final\\s+season\\b"), " ")
-        .replace(Regex("\\b\\d+(?:st|nd|rd|th)\\s+season\\b"), " ")
-        .replace(Regex("\\bseason\\s*\\d+\\b"), " ")
-        .replace(Regex("\\bpart\\s*\\d+\\b"), " ")
-        .replace(Regex("\\bcour\\s*\\d+\\b"), " ")
-        .replace(Regex("\\bs\\s*\\d+\\b"), " ")
-        .replace(Regex("[^a-z0-9]+"), " ")
-        .trim()
-
-    private fun seasonNumber(title: String): Int? = Regex("(?:season\\s*(\\d+)|(\\d+)(?:st|nd|rd|th)\\s+season|\\bs\\s*(\\d+)\\b)", RegexOption.IGNORE_CASE)
-        .find(title)?.groupValues?.drop(1)?.firstOrNull { it.isNotBlank() }?.toIntOrNull()
-
     private fun deobfuscate(blob: String): String {
         val bytes = Base64.decode(blob, Base64.DEFAULT)
         val key = "otaku-embed-v1".encodeToByteArray()
@@ -469,14 +515,12 @@ class HiAnimeRepository {
     }
 
     private fun fetch(url: String, referer: String = "$BASE/"): String {
-        val connection = URL(url).openConnection() as HttpURLConnection
-        connection.connectTimeout = 15_000
-        connection.readTimeout = 20_000
-        connection.setRequestProperty("User-Agent", USER_AGENT)
-        connection.setRequestProperty("Referer", referer)
-        connection.setRequestProperty("Accept", "text/html,application/json,*/*")
-        connection.setRequestProperty("Accept-Language", "pt-BR,pt;q=0.9,en;q=0.7")
-        return try { connection.inputStream.bufferedReader(Charsets.UTF_8).use { it.readText() } } finally { connection.disconnect() }
+        return HttpTransport.text(url, mapOf(
+            "User-Agent" to USER_AGENT,
+            "Referer" to referer,
+            "Accept" to "text/html,application/json,*/*",
+            "Accept-Language" to "pt-BR,pt;q=0.9,en;q=0.7",
+        ))
     }
 
     companion object {

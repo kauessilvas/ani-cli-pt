@@ -8,6 +8,16 @@ class PlaybackPolicyTest {
     private fun source(label: String, height: Int = 720, audio: String = "Áudio original", provider: String = "hi:anime") =
         PlaybackSource("https://example.test/video", null, "https://example.test/", "Anime", "1", audio, label, listOf(height), provider)
 
+    @Test fun primaryFastPathRequiresConfirmedAudioOrPortugueseSubtitles() {
+        assertTrue(canPlayPrimaryImmediately(source("Legenda da fonte", provider = "anime#s1"), dubbed = false))
+        assertTrue(canPlayPrimaryImmediately(source("Legenda PT-BR · fonte do vídeo"), dubbed = false))
+        assertFalse(canPlayPrimaryImmediately(source("Legenda em inglês · fallback"), dubbed = false))
+        assertFalse(canPlayPrimaryImmediately(source("Sem PT-BR · configure OpenSubtitles"), dubbed = false))
+        assertFalse(canPlayPrimaryImmediately(source("Legenda da fonte", provider = "hi:anime"), dubbed = false))
+        assertTrue(canPlayPrimaryImmediately(source("Áudio dublado", audio = "Dublado PT-BR"), dubbed = true))
+        assertFalse(canPlayPrimaryImmediately(source("Áudio original", audio = "Áudio original · dublagem PT-BR indisponível"), dubbed = true))
+    }
+
     @Test fun portugueseSourceWinsAndExternalIsNotCalled() = runBlocking {
         var externalCalls = 0
         val chosen = choosePlaybackSource(false, true,

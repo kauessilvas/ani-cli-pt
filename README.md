@@ -159,6 +159,8 @@ python3 -m unittest discover -s web/tests -v
 
 O repositório também contém o projeto Android em Kotlin em [`android-app/`](./android-app/). Ele é independente da interface web e do servidor local: consulta o catálogo no próprio aparelho, mantém favoritos e histórico no armazenamento local, prioriza legendas PT-BR com fallback para português e inglês e reproduz HLS no player Android. Sinopses priorizam texto em português das fontes e do TMDB; quando necessário, sinopses e títulos de episódios podem usar tradução automática via MyMemory. O texto público enviado para tradução está sujeito à disponibilidade e à cota diária anônima do serviço. Algumas sinopses podem permanecer indisponíveis. Nas configurações, personalize tamanho, cor, tipo de letra e fundo das legendas.
 
+Para manter o padrão visual e de interação nas próximas alterações, consulte o [guia de estilo do aplicativo Android](./android-app/STYLE_GUIDE.md).
+
 Baixe a versão de depuração para Android 8.0 ou mais recente na [página de releases](https://github.com/kauessilvas/ani-cli-pt/releases/latest), que inclui o APK como arquivo para download. Este APK é uma prévia para testes, assinada com a chave de depuração do Android; o Android pode exibir alertas de segurança ao instalar aplicativos distribuídos fora da Play Store.
 
 Para abrir o projeto, use o Android Studio e selecione a pasta `android-app`. Na primeira abertura, o Gradle baixa as dependências do projeto e o Android Studio configura o SDK. Conecte um aparelho Android com depuração USB ativada ou crie um emulador e execute a configuração `app`.
@@ -178,7 +180,7 @@ Para preparar uma release, execute `scripts/publish-android-release.sh --check-o
 
 O aplicativo mantém buscas e detalhes recentemente consultados em cache temporário na memória, com prazo e limite de itens. O cache é recriado ao fechar o processo do app; falhas de rede e sinopses ausentes não são guardadas como resultados permanentes.
 
-O animesonline.cloud é consultado somente como último recurso quando as fontes normais não conseguem reproduzir o episódio. Ele não participa do catálogo, da busca visível, dos cards ou dos metadados. O fallback exige título e episódio correspondentes, áudio explicitamente identificado e um link direto de vídeo acessível; quando essas condições não são atendidas, o app mantém o erro ou a escolha de áudio original.
+O animesonline.cloud continua fora do catálogo e da busca visível. Suas páginas podem complementar pôsteres, títulos em português e imagens de episódios de animes já identificados, após conferir título, lançamento e numeração. O app prepara metadados dos cards visíveis e guarda os resultados validados no aparelho para que a seleção de episódios reabra completa enquanto a fonte é atualizada. A reprodução por essa fonte permanece como último recurso quando as fontes normais falham; ela exige título e episódio correspondentes, áudio explicitamente identificado e um link direto de vídeo acessível.
 
 Nas configurações, é possível ocultar conteúdo adulto identificado pelos metadados das fontes. A classificação pode estar ausente ou incompleta; a opção não garante a ocultação de todos os títulos +18. Os cartões só mostram tags de áudio quando um stream ativo foi encontrado em um dos episódios consultados; a disponibilidade pode variar entre episódios e mudar depois da consulta. Títulos sem episódios e sem alternativas associadas são removidos quando essa informação é confirmada; uma lista de episódios não garante que todos os vídeos estejam funcionando.
 

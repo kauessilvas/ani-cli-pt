@@ -27,7 +27,8 @@ import java.io.File
 import java.io.FileOutputStream
 import java.io.IOException
 import java.security.MessageDigest
-import java.net.HttpURLConnection
+import dev.aniclipt.app.data.HttpTransport
+import dev.aniclipt.app.data.local.UserPreferencesStore
 import java.net.URL
 import java.util.concurrent.TimeUnit
 
@@ -35,8 +36,10 @@ private class UpdateFailure(val status: String, message: String) : Exception(mes
 
 class ReleaseUpdateWorker(context: Context, params: WorkerParameters) : CoroutineWorker(context, params) {
     override suspend fun doWork(): Result = withContext(Dispatchers.IO) {
+        val preferences = UserPreferencesStore(applicationContext)
+        preferences.migrateLegacyIfNeeded()
         val prefs = applicationContext.getSharedPreferences("ani-cli-pt", Context.MODE_PRIVATE)
-        val automaticDownloadsEnabled = prefs.getBoolean(PREF_ENABLED, false)
+        val automaticDownloadsEnabled = preferences.current().automaticReleaseUpdates
         val launchCheck = inputData.getBoolean(INPUT_LAUNCH_CHECK, false)
         val manualDownload = inputData.getBoolean(INPUT_MANUAL_DOWNLOAD, false)
         val shouldDownload = automaticDownloadsEnabled || manualDownload
@@ -47,19 +50,15 @@ class ReleaseUpdateWorker(context: Context, params: WorkerParameters) : Coroutin
         if (manualDownload) prefs.edit().putString(PREF_DOWNLOAD_STATUS, STATUS_DOWNLOADING).apply()
 
         runCatching {
-            val connection = URL(LATEST_RELEASE_API).openConnection() as HttpURLConnection
-            connection.connectTimeout = 12_000
-            connection.readTimeout = 12_000
-            connection.setRequestProperty("Accept", "application/vnd.github+json")
-            connection.setRequestProperty("User-Agent", "ani-cli-pt-android")
-            val release = try {
-                val response = connection.responseCode
-                if (response !in 200..299) {
-                    val status = if (response == 403 || response == 429) STATUS_FAILED_RATE_LIMIT else STATUS_FAILED_SERVER
-                    throw UpdateFailure(status, "GitHub respondeu com HTTP $response")
+            val release = HttpTransport.execute(LATEST_RELEASE_API,
+                mapOf("Accept" to "application/vnd.github+json", "User-Agent" to "ani-cli-pt-android"),
+                connectTimeoutMillis = 12_000, readTimeoutMillis = 12_000).use { response ->
+                if (!response.isSuccessful) {
+                    val status = if (response.code == 403 || response.code == 429) STATUS_FAILED_RATE_LIMIT else STATUS_FAILED_SERVER
+                    throw UpdateFailure(status, "GitHub respondeu com HTTP ${response.code}")
                 }
-                connection.inputStream.bufferedReader().use { JSONObject(it.readText()) }
-            } finally { connection.disconnect() }
+                JSONObject(response.body?.string().orEmpty())
+            }
 
             val latestTag = release.optString("tag_name").removePrefix("v").ifBlank { error("O GitHub não informou uma versão de release.") }
             @Suppress("DEPRECATION")
@@ -110,18 +109,13 @@ class ReleaseUpdateWorker(context: Context, params: WorkerParameters) : Coroutin
         val parent = destination.parentFile ?: throw UpdateFailure(STATUS_FAILED_STORAGE, "Pasta da atualização indisponível.")
         if (!parent.isDirectory && !parent.mkdirs()) throw UpdateFailure(STATUS_FAILED_STORAGE, "Não foi possível criar a pasta da atualização.")
         val temporary = File(destination.parentFile, "${destination.name}.part")
-        val connection = URL(url).openConnection() as HttpURLConnection
-        connection.connectTimeout = 20_000
-        connection.readTimeout = 40_000
-        connection.instanceFollowRedirects = true
-        connection.setRequestProperty("User-Agent", "ani-cli-pt-android")
-        try {
-            val response = connection.responseCode
-            if (response !in 200..299) {
-                val status = if (response == 403 || response == 429) STATUS_FAILED_RATE_LIMIT else STATUS_FAILED_SERVER
-                throw UpdateFailure(status, "Download respondeu com HTTP $response")
+        try { HttpTransport.execute(url, mapOf("User-Agent" to "ani-cli-pt-android"),
+            connectTimeoutMillis = 20_000, readTimeoutMillis = 40_000).use { response ->
+            if (!response.isSuccessful) {
+                val status = if (response.code == 403 || response.code == 429) STATUS_FAILED_RATE_LIMIT else STATUS_FAILED_SERVER
+                throw UpdateFailure(status, "Download respondeu com HTTP ${response.code}")
             }
-            connection.inputStream.use { input ->
+            (response.body?.byteStream() ?: throw UpdateFailure(STATUS_FAILED_SERVER, "Download sem conteúdo.")).use { input ->
                 val output = try { FileOutputStream(temporary) } catch (failure: IOException) {
                     throw UpdateFailure(STATUS_FAILED_STORAGE, "Não foi possível criar o arquivo da atualização.")
                 }
@@ -139,11 +133,9 @@ class ReleaseUpdateWorker(context: Context, params: WorkerParameters) : Coroutin
             if (temporary.length() <= MIN_APK_SIZE) throw UpdateFailure(STATUS_FAILED_INVALID, "O APK baixado está incompleto.")
             if (expectedDigest != null && !sha256(temporary).equals(expectedDigest, ignoreCase = true)) throw UpdateFailure(STATUS_FAILED_INVALID, "A verificação do APK falhou.")
             if (!temporary.renameTo(destination)) throw UpdateFailure(STATUS_FAILED_STORAGE, "Não foi possível salvar o APK baixado.")
-        } catch (error: Throwable) {
+        } } catch (error: Throwable) {
             temporary.delete()
             throw error
-        } finally {
-            connection.disconnect()
         }
     }
 

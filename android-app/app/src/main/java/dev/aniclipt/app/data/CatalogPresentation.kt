@@ -11,6 +11,16 @@ internal fun catalogTags(anime: Anime): List<String> {
 internal fun showInCatalog(anime: Anime, hideAdult: Boolean): Boolean =
     anime.availability != Availability.EMPTY && (!hideAdult || anime.isAdult != true && !knownSuggestiveTitle(anime.title))
 
+/** A home section should add titles, not repeat cards already shown above it. */
+internal fun visibleHomeSections(sections: List<HomeSection>, excluded: List<Anime>, hideAdult: Boolean): List<HomeSection> {
+    val seen = excluded.map { matchingTitle(it.title, it.anilistId) }.toMutableSet()
+    return sections.mapNotNull { section ->
+        val items = section.items.filter { showInCatalog(it, hideAdult) }
+            .filter { seen.add(matchingTitle(it.title, it.anilistId)) }
+        items.takeIf { it.isNotEmpty() }?.let { section.copy(items = it) }
+    }
+}
+
 /** Explicit sexual-content labels; broad genres such as romance and harem are not enough. */
 internal fun hasAdultContentLabels(genres: List<String>, tags: List<Pair<String, Int>> = emptyList()): Boolean =
     genres.any { it.trim().lowercase(java.util.Locale.ROOT) in setOf("ecchi", "hentai") } ||

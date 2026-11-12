@@ -59,4 +59,13 @@ class CatalogPresentationTest {
         assertTrue(showInCatalog(Anime("b", "Mayoi Neko Overrun: Another Story"), true))
         assertTrue(showInCatalog(Anime("c", "Mayoi Neko Overrun!"), false))
     }
+    @Test fun homeSectionsExcludeRepeatedAndAdultCards() {
+        val sections = listOf(
+            HomeSection("Populares", listOf(Anime("hi:one-piece", "One Piece"), Anime("hi:bleach", "Bleach"))),
+            HomeSection("Em alta", listOf(Anime("hi:bleach-alt", "Bleach"), Anime("hi:adult", "Adulto", isAdult = true), Anime("hi:naruto", "Naruto"))),
+        )
+        val visible = visibleHomeSections(sections, listOf(Anime("fire:one-piece", "One Piece")), hideAdult = true)
+        assertEquals(listOf("Bleach"), visible[0].items.map { it.title })
+        assertEquals(listOf("Naruto"), visible[1].items.map { it.title })
+    }
 }
